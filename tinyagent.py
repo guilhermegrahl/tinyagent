@@ -36,6 +36,7 @@ import asyncio  # noqa: F401  # populated in T11+
 import contextlib  # noqa: F401
 import dataclasses  # noqa: F401
 from functools import cached_property  # T7: AgentTrace.tokens / .cost roll-ups
+import inspect  # T4: @tool decorator uses inspect.signature
 import json  # noqa: F401
 import logging
 import os  # noqa: F401
@@ -46,7 +47,11 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Protocol,
     TypedDict,
+    cast,
+    get_origin,
+    overload,
 )
 
 from typing_extensions import TypeAlias  # used at type hints below
@@ -319,20 +324,259 @@ class Context:
 
 # =====================================================================
 # Section 9 - Tool helpers (@tool decorator + wrappers)
-# ====================================================================
-def tool(fn: Callable[..., Any] | None = None, **kwargs: Any) -> Callable[..., Any]:
-    """Stub decorator. Full @tool implementation lands in T4.
+# =====================================================================
+# Mapping from a Python primitive type to its JSON-Schema type string.
+# Used by `@tool` to materialise the parameter schema and by `_cast_argument`
+# to coerce stringified JSON values back into their declared type.
+_PRIMITIVE_JSON_TYPES: dict[type, str] = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    list: "array",
+    dict: "object",
+}
 
-    Accepts either `@tool` (no-arg) or `@tool(...)` (kwarg) call forms.
+
+def _json_schema_type(annotation: Any) -> str | None:
+    """Map a Python annotation to a JSON-Schema type string.
+
+    Returns None for annotations we don't recognise; the schema builder
+    skips the `type` field in that case so callers can still inspect the
+    parameter name and default.
     """
+    if annotation in _PRIMITIVE_JSON_TYPES:
+        return _PRIMITIVE_JSON_TYPES[annotation]
+    # Parameterised generics: list[X], dict[X, Y] → "array" / "object".
+    origin = get_origin(annotation)
+    if origin in _PRIMITIVE_JSON_TYPES:
+        return _PRIMITIVE_JSON_TYPES[origin]
+    return None
+
+
+def _build_json_schema(fn: Callable[..., Any]) -> dict[str, Any]:
+    """Build an OpenAI-compatible JSON schema dict from a callable's signature.
+
+    The schema contains:
+      - `name`: the callable's __name__
+      - `description`: the callable's docstring (None if absent)
+      - `parameters`: JSON-Schema object with `properties` (name → {type, default?})
+        and `required` (parameter names with no default value, in signature order)
+
+    String annotations (e.g. from `from __future__ import annotations` or
+    `PEP 563` string-form hints) are resolved via `inspect.signature`'s
+    `eval_str=True` mode, which evaluates them against the function's
+    `__globals__` and the builtins.
+    """
+    try:
+        sig = inspect.signature(fn, eval_str=True)
+    except (NameError, TypeError):
+        # If evaluation fails (e.g. undefined forward reference), fall back
+        # to the raw signature and accept string annotations as unresolvable.
+        sig = inspect.signature(fn)
+    properties: dict[str, dict[str, Any]] = {}
+    required: list[str] = []
+    for name, param in sig.parameters.items():
+        # Skip *args / **kwargs — tools never expose variadic params to the LLM.
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        entry: dict[str, Any] = {}
+        json_type = _json_schema_type(param.annotation)
+        if json_type is not None:
+            entry["type"] = json_type
+        if param.default is not inspect.Parameter.empty:
+            entry["default"] = param.default
+        properties[name] = entry
+        if param.default is inspect.Parameter.empty:
+            required.append(name)
+    return {
+        "name": fn.__name__,
+        "description": inspect.getdoc(fn),
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        },
+    }
+
+
+class _ToolCallable(Protocol):
+    """Structural type for a function decorated with `@tool`.
+
+    The decorator attaches two extra attributes to the wrapped callable:
+    `tool_schema` (the JSON-Schema dict) and `is_tool` (always True).
+    mypy is told this Protocol is the return type; the cast in `_attach_schema`
+    is a runtime no-op.
+    """
+
+    tool_schema: dict[str, Any]
+    is_tool: bool
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+def _attach_schema(fn: Callable[..., Any], schema: dict[str, Any]) -> _ToolCallable:
+    """Attach `tool_schema` and `is_tool` attributes to `fn` in-place.
+
+    `functools.wraps` is intentionally NOT used here: the decorated function
+    is the same object as the original, so `inspect.signature`, docstring,
+    __name__, and async-ness are all preserved without explicit copying.
+    """
+    annotated: _ToolCallable = cast("_ToolCallable", fn)
+    annotated.tool_schema = schema
+    annotated.is_tool = True
+    return annotated
+
+
+@overload
+def tool(fn: Callable[..., Any], **kwargs: Any) -> _ToolCallable: ...
+
+
+@overload
+def tool(
+    fn: None = None,
+    **kwargs: Any,
+) -> Callable[[Callable[..., Any]], _ToolCallable]: ...
+
+
+def tool(
+    fn: Callable[..., Any] | None = None,
+    **kwargs: Any,
+) -> _ToolCallable | Callable[[Callable[..., Any]], _ToolCallable]:
+    """Decorate a callable as a tinyagent tool.
+
+    Accepts both call forms:
+      - `@tool` (no parens)
+      - `@tool` (parens, no kwargs)
+      - `@tool(name=...)` (parens, kwargs; kwargs are stored on the schema)
+
+    The decorated callable keeps its original signature, return type, and
+    (for async) its coroutine semantics; the decorator only attaches
+    `tool_schema` (an OpenAI-compatible JSON-Schema dict) and `is_tool=True`.
+    """
+
+    def _decorate(target: Callable[..., Any]) -> _ToolCallable:
+        schema = _build_json_schema(target)
+        if kwargs:
+            # Expose the decorator kwargs under a reserved namespace so they
+            # survive the round-trip to the LLM tool spec without polluting
+            # the parameter list.
+            schema["decorator_kwargs"] = dict(kwargs)
+        return _attach_schema(target, schema)
+
+    if fn is not None:
+        # `@tool` (no-paren) form: fn is the decorated callable directly.
+        return _decorate(fn)
+    # `@tool(...)` (parens) form: return a decorator that accepts the function.
+    return _decorate
 
 
 def _wrap_no_exception(callable_: Callable[..., Any]) -> Callable[..., Any]:
-    """Stub. Full implementation lands in T4 (lifted from upstream wrappers.py)."""
+    """Wrap a bare-Python tool so its exceptions become a string result.
+
+    On the success path, the wrapper passes the call through to the
+    underlying callable unchanged. On any `Exception` it returns the string
+    ``"Error calling tool: {e}"`` so the agent loop can feed a recoverable
+    error message back to the LLM instead of crashing the run.
+    """
+
+    if asyncio.iscoroutinefunction(callable_):
+
+        @functools.wraps(callable_)
+        async def _async_wrapped(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await callable_(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 — bare-tool adapter; the
+                # loop relies on the string-return contract, so we catch
+                # broadly to keep the run alive.
+                return f"Error calling tool: {exc}"
+
+        return _async_wrapped
+
+    @functools.wraps(callable_)
+    def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return callable_(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — see note above.
+            return f"Error calling tool: {exc}"
+
+    return _wrapped
+
+
+# Truthy / falsy string spellings accepted by `_cast_argument(..., bool)`.
+_BOOL_TRUE_STRINGS: frozenset[str] = frozenset({"true", "1", "yes"})
+_BOOL_FALSE_STRINGS: frozenset[str] = frozenset({"false", "0", "no"})
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Coerce a value to bool, recognising common string spellings."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lower = value.strip().lower()
+        if lower in _BOOL_TRUE_STRINGS:
+            return True
+        if lower in _BOOL_FALSE_STRINGS:
+            return False
+    return bool(value)
+
+
+def _coerce_json_container(value: Any, target: type) -> Any:
+    """Coerce a value to a list/dict, parsing JSON strings.
+
+    Used for `list`, `dict`, and their parameterised forms (`list[X]`,
+    `dict[X, Y]`). String inputs are parsed as JSON; native values are
+    re-materialised via the target's constructor.
+    """
+    if isinstance(value, str):
+        return json.loads(value)
+    return target(value)
+
+
+# Dispatch table for the numeric / string scalar casts: a target type
+# → its corresponding coercion function. Built once at import time so
+# `_cast_argument` is a flat dispatch and stays under the PLR0911
+# (return-statement) budget.
+_SCALAR_COERCERS: dict[type, Callable[[Any], Any]] = {
+    str: str,
+    int: int,
+    float: float,
+    bool: _coerce_bool,
+}
 
 
 def _cast_argument(value: Any, param_annotation: Any) -> Any:
-    """Stub. Full implementation lands in T4 (lifted from upstream utils/cast.py)."""
+    """Coerce a value to a primitive type declared by a tool parameter.
+
+    Handles the primitive types the agent surfaces to the LLM:
+    `str`, `int`, `float`, `bool`, `list`, `dict` (including their
+    parameterised forms `list[X]`, `dict[X, Y]`). String values destined
+    for `list` / `dict` are parsed as JSON. Unknown annotations return
+    the value unchanged.
+    """
+    # Avoid clobbering explicit None on optional parameters.
+    if value is None:
+        return None
+
+    # Resolve the "effective" target type. Parameterised generics
+    # (`list[X]`, `dict[X, Y]`) collapse to their origin type so we
+    # don't have to introspect the type args.
+    target = param_annotation
+    origin = get_origin(param_annotation)
+    if origin in (list, dict):
+        target = origin
+
+    coercer = _SCALAR_COERCERS.get(target)
+    if coercer is not None:
+        return coercer(value)
+    if target in (list, dict):
+        return _coerce_json_container(value, target)
+
+    # Unknown annotation: pass the value through.
+    return value
 
 
 # =====================================================================
