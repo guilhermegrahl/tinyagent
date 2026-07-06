@@ -200,57 +200,6 @@ DEFAULT_PRICING: dict[str, tuple[float, float]] = {
 PRICING_OVERRIDE: dict[str, tuple[float, float]] = {}
 
 
-def _estimate_cost(
-    model_id: str,
-    prompt_tokens: int,
-    completion_tokens: int,
-) -> float | None:
-    """Estimate USD cost for an LLM call. Returns None when price is unknown.
-
-    Lookup order (CANONICAL — plan §7):
-      1. Local provider? -> None (no per-token price for self-hosted).
-      2. Longest-prefix match in PRICING_OVERRIDE (wins over DEFAULT_PRICING).
-      3. Longest-prefix match in DEFAULT_PRICING.
-      4. Otherwise -> None. NEVER return 0.00 for an unknown model.
-
-    Pricing tuples are (input_usd_per_1m, output_usd_per_1m). USD formula:
-        cost = (prompt_tokens / 1_000_000) * input_price
-             + (completion_tokens / 1_000_000) * output_price
-
-    Args:
-        model_id: The full model string, e.g. "openai:gpt-4o-2024-05-13".
-        prompt_tokens: Number of input tokens consumed.
-        completion_tokens: Number of output tokens generated.
-
-    Returns:
-        USD cost as a float, or None when price is unknown.
-    """
-    # 1. Local provider short-circuit.
-    provider = model_id.partition(":")[0]
-    if provider in LOCAL_PROVIDERS:
-        return None
-
-    # 2+3. Longest-prefix match against override first, then defaults.
-    # Sort keys descending by length so the longest match wins deterministically.
-    def _longest_match(table: dict[str, tuple[float, float]]) -> tuple[float, float] | None:
-        best_key: str | None = None
-        for key in table:
-            if model_id.startswith(key) and (best_key is None or len(key) > len(best_key)):
-                best_key = key
-        if best_key is None:
-            return None
-        return table[best_key]
-
-    pricing_tuple = _longest_match(PRICING_OVERRIDE) or _longest_match(DEFAULT_PRICING)
-    if pricing_tuple is None:
-        return None
-
-    input_price_per_1m, output_price_per_1m = pricing_tuple
-    return (prompt_tokens / 1_000_000) * input_price_per_1m + (
-        completion_tokens / 1_000_000
-    ) * output_price_per_1m
-
-
 # =====================================================================
 # Section 6 - Exceptions (CANONICAL — every exception the library raises)
 # =====================================================================
@@ -1574,6 +1523,18 @@ def _estimate_cost(
     cost (free / included-credit models); only ``None`` triggers the
     omit.
 
+    Lookup order (CANONICAL — plan §7 + §2 §14):
+
+      1. ``pricing_fn(model_id)`` if provided — callable wins.
+      2. ``pricing`` per-instance override (T13) — full replacement of the
+         lookup table; if a model is not in ``pricing`` and ``pricing`` is
+         non-``None``, the function returns ``None`` (no fallback to
+         ``PRICING_OVERRIDE`` or ``DEFAULT_PRICING``).
+      3. ``PRICING_OVERRIDE`` module-level dict (legacy T2 API). Longest-
+         prefix match within it. If no match, falls back to step 4.
+      4. ``DEFAULT_PRICING``. Longest-prefix match within it. If no
+         match, the function returns ``None``.
+
     Parameters
     ----------
     model_id:
@@ -1584,7 +1545,11 @@ def _estimate_cost(
         Output tokens emitted by this call.
     pricing:
         Optional full-table override (provider:model -> per-1M tuple).
-        Wins over ``DEFAULT_PRICING`` when provided.
+        When non-``None``, this is a full replacement of the lookup
+        table for this call (per plan §7 "``pricing or DEFAULT_PRICING``").
+        Used by T13 to plumb the per-instance ``AgentConfig.pricing``
+        override through to the span writer. Wins over ``PRICING_OVERRIDE``
+        and ``DEFAULT_PRICING``.
     pricing_fn:
         Optional per-call callable returning ``(input_per_1m,
         output_per_1m)`` or ``None``. Highest precedence.
@@ -1598,12 +1563,45 @@ def _estimate_cost(
         if price is None:
             return None
         return _cost_from_price(prompt_tokens, completion_tokens, price)
-    table = pricing if pricing is not None else DEFAULT_PRICING
     provider, _, _ = model_id.partition(":")
     if provider in LOCAL_PROVIDERS:
         return None
-    # Longest-prefix match (plan §7): pick the most specific table key
-    # that ``model_id`` starts with. No match → unknown → None.
+    # Per-instance override (T13): full replacement. The override REPLACES
+    # both PRICING_OVERRIDE and DEFAULT_PRICING for this call — if a
+    # model is not in the override, return None (the agent's table is
+    # authoritative for that model).
+    if pricing is not None:
+        candidates = sorted(
+            (k for k in pricing if model_id.startswith(k)),
+            key=len,
+            reverse=True,
+        )
+        if not candidates:
+            return None
+        return _cost_from_price(prompt_tokens, completion_tokens, pricing[candidates[0]])
+    # Module-level PRICING_OVERRIDE (legacy T2 API) — try it first, fall
+    # back to DEFAULT_PRICING on miss. ``or`` semantics: the override
+    # takes precedence when present, DEFAULT_PRICING covers everything else.
+    override_match = _longest_prefix_match(PRICING_OVERRIDE, model_id)
+    if override_match is not None:
+        return _cost_from_price(prompt_tokens, completion_tokens, override_match)
+    default_match = _longest_prefix_match(DEFAULT_PRICING, model_id)
+    if default_match is None:
+        return None
+    return _cost_from_price(prompt_tokens, completion_tokens, default_match)
+
+
+def _longest_prefix_match(
+    table: dict[str, tuple[float, float]],
+    model_id: str,
+) -> tuple[float, float] | None:
+    """Return the value of the longest-key prefix-match in ``table``, or ``None``.
+
+    Helper for ``_estimate_cost``. ``model_id`` is matched against each
+    key in ``table`` via ``startswith``; the longest matching key wins.
+    If no key matches, returns ``None`` so the caller can fall back to
+    the next table.
+    """
     candidates = sorted(
         (k for k in table if model_id.startswith(k)),
         key=len,
@@ -1611,7 +1609,7 @@ def _estimate_cost(
     )
     if not candidates:
         return None
-    return _cost_from_price(prompt_tokens, completion_tokens, table[candidates[0]])
+    return table[candidates[0]]
 
 
 def _cost_from_price(
@@ -1635,6 +1633,7 @@ def _compute_cost_attribute(
     model_id: str,
     prompt_tokens: int,
     completion_tokens: int,
+    pricing: dict[str, tuple[float, float]] | None = None,
 ) -> float | None:
     """Return the cost-attribute value for a span, or ``None`` when price is unknown.
 
@@ -1644,8 +1643,13 @@ def _compute_cost_attribute(
     omit ``gen_ai.usage.cost`` from the span when this returns
     ``None``. Returning ``0.0`` is forbidden (it would make "unknown"
     indistinguishable from "actually free" in downstream dashboards).
+
+    The ``pricing`` kwarg (T13) lets the span writer pass the per-
+    instance override down to ``_estimate_cost`` so that the cost
+    attribute reflects the agent's configured pricing table rather
+    than the global default.
     """
-    return _estimate_cost(model_id, prompt_tokens, completion_tokens)
+    return _estimate_cost(model_id, prompt_tokens, completion_tokens, pricing=pricing)
 
 
 # ---------------------------------------------------------------------
@@ -1668,7 +1672,12 @@ class _SpanGeneration:
     indistinguishable from "actually free" in observability tooling.
     """
 
-    def __init__(self, tracer: Any, model_id: str) -> None:
+    def __init__(
+        self,
+        tracer: Any,
+        model_id: str,
+        pricing: dict[str, tuple[float, float]] | None = None,
+    ) -> None:
         """Store the tracer and the model id used in ``gen_ai.request.model``.
 
         Parameters
@@ -1680,9 +1689,17 @@ class _SpanGeneration:
             Provider-prefixed model string, e.g. ``"openai:gpt-4o-mini"``.
             Stored on the instance so every span it opens carries
             ``gen_ai.request.model``.
+        pricing:
+            Optional per-instance pricing override (T13). When non-``None``,
+            this table is consulted (longest-prefix match) by
+            ``_compute_cost_attribute`` for cost estimation. ``None`` falls
+            back to the module-level ``PRICING_OVERRIDE`` then
+            ``DEFAULT_PRICING`` lookup chain. The override is held on the
+            instance only — it is NOT copied into module-level state.
         """
         self._tracer = tracer
         self._model_id = model_id
+        self._pricing_override = pricing
 
     def call_llm(self, response: Any) -> Any:
         """Open a ``call_llm`` span with token + cost attrs from ``response``.
@@ -1699,6 +1716,12 @@ class _SpanGeneration:
         When ``response`` has no ``usage`` attribute, the token and
         cost attributes are simply absent (no zero-defaulting).
 
+        Cost estimation honours the per-instance ``pricing`` override
+        passed to ``__init__`` (T13 wiring). The omit-when-``None`` rule
+        (§0 C2 + cross-cutting risk #8) still applies: if the price is
+        unknown for this model, the cost attribute is omitted entirely
+        (NEVER written as ``0.0``).
+
         Returns the OTel context-manager produced by
         ``tracer.start_as_current_span("call_llm", attributes=...)``.
         Use as ``with span_gen.call_llm(response): ...``.
@@ -1713,7 +1736,10 @@ class _SpanGeneration:
             out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
             attrs["gen_ai.usage.input_tokens"] = in_tok
             attrs["gen_ai.usage.output_tokens"] = out_tok
-            cost = _compute_cost_attribute(self._model_id, in_tok, out_tok)
+            cost = _compute_cost_attribute(
+                self._model_id, in_tok, out_tok,
+                pricing=self._pricing_override,
+            )
             if cost is not None:
                 attrs["gen_ai.usage.cost"] = cost
         return self._tracer.start_as_current_span("call_llm", attributes=attrs)
@@ -1813,9 +1839,17 @@ class AgentConfig(BaseModel):
       - ``callbacks: CallbackRegistry | None`` — optional user-supplied
         registry. ``None`` means ``TinyAgent.__init__`` builds a fresh
         empty one (so the agent always has a valid ``_callbacks``).
-      - ``pricing_override: dict | None`` — optional per-instance
-        pricing table (``provider:model`` -> ``(input, output)`` USD per
-        1M tokens). Wired into ``PRICING_OVERRIDE`` in T13.
+      - ``pricing: dict | None`` — optional per-instance pricing table
+        (``provider:model`` -> ``(input, output)`` USD per 1M tokens).
+        T13: when non-``None``, the agent stores a defensive copy as
+        ``self._pricing_override`` and uses it for cost estimation. The
+        override is instance-local — it is NOT copied into module-level
+        ``PRICING_OVERRIDE``.
+      - ``pricing_override: dict | None`` — deprecated alias for
+        ``pricing``. T11 originally shipped the field under this name;
+        T13 renames it to ``pricing`` per plan §2 §14 while keeping the
+        old name as a back-compat alias. When both are set, ``pricing``
+        wins.
       - ``name: str``             — default ``"tinyagent"``. Used as the
         OTel tracer instrumentation name.
       - ``description: str``      — default ``""``. Free-form agent
@@ -1836,7 +1870,8 @@ class AgentConfig(BaseModel):
     max_turns: int = DEFAULT_MAX_TURNS
     keep_last_n: int = DEFAULT_KEEP_LAST_N
     callbacks: Any = None  # CallbackRegistry | None — typed as Any to avoid forward-ref churn
-    pricing_override: dict[str, tuple[float, float]] | None = None
+    pricing: dict[str, tuple[float, float]] | None = None  # T13: canonical per-instance pricing override
+    pricing_override: dict[str, tuple[float, float]] | None = None  # T11 deprecated alias
     name: str = "tinyagent"
     description: str = ""
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
@@ -2034,6 +2069,22 @@ class TinyAgent:
         # to call .connect() (T10).
         self._mcp_servers: list[Any] = list(config.mcp_servers)
 
+        # T13: per-instance pricing override. Stored as a defensive
+        # copy on the agent so caller mutations to the original
+        # ``AgentConfig.pricing`` dict do NOT leak into runtime. The
+        # override is instance-local: it is NOT copied into the
+        # module-level ``PRICING_OVERRIDE`` dict (that global remains a
+        # separate escape hatch for users who want to mutate it
+        # directly). ``pricing_override`` is kept as a deprecated alias
+        # for backward compatibility with T11's AgentConfig — when
+        # ``pricing`` is ``None`` we fall back to it.
+        pricing_source: dict[str, tuple[float, float]] | None = (
+            config.pricing if config.pricing is not None else config.pricing_override
+        )
+        self._pricing_override: dict[str, tuple[float, float]] | None = (
+            dict(pricing_source) if pricing_source is not None else None
+        )
+
     async def setup(self) -> None:
         """Open MCP server connections and merge their tools into ``_clients``.
 
@@ -2082,7 +2133,9 @@ class TinyAgent:
             any_llm.acompletion(**completion_params),
             timeout=self.config.request_timeout_s,
         )
-        span_gen = _SpanGeneration(self._tracer, self.config.model)
+        span_gen = _SpanGeneration(
+            self._tracer, self.config.model, pricing=self._pricing_override
+        )
         with span_gen.call_llm(response):
             pass
         return response

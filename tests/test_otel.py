@@ -210,7 +210,12 @@ def test_call_llm_span_writes_zero_cost_when_estimate_returns_zero(
 # _compute_cost_attribute helper
 # ---------------------------------------------------------------------
 def test_compute_cost_attribute_passes_through_estimate_cost() -> None:
-    """``_compute_cost_attribute`` delegates to ``_estimate_cost`` and returns its value verbatim."""
+    """``_compute_cost_attribute`` delegates to ``_estimate_cost`` and returns its value verbatim.
+
+    T13 plumbing: ``_compute_cost_attribute`` accepts a ``pricing`` kwarg
+    so the per-instance override can flow through. When no override is
+    supplied, the kwarg defaults to ``None``.
+    """
     sentinel = 0.001234
     with patch.object(
         tinyagent, "_estimate_cost", return_value=sentinel
@@ -219,7 +224,9 @@ def test_compute_cost_attribute_passes_through_estimate_cost() -> None:
             "openai:gpt-4o-mini", 1000, 500
         )
     assert result is sentinel
-    mock_estimate.assert_called_once_with("openai:gpt-4o-mini", 1000, 500)
+    mock_estimate.assert_called_once_with(
+        "openai:gpt-4o-mini", 1000, 500, pricing=None
+    )
 
 
 def test_compute_cost_attribute_returns_none_when_estimate_returns_none() -> None:
