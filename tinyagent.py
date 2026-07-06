@@ -2423,6 +2423,52 @@ class TinyAgent:
         """Stub: returns an async context manager of synthesised tools. Lands in T14."""
         raise NotImplementedError
 
+    # ------------------------------------------------------------------
+    # Sync wrapper — T12c (round-2 M3 closure)
+    # ------------------------------------------------------------------
+    def run(self, prompt: str, **kwargs: Any) -> str:
+        """Run the agent and return the final answer — synchronous entry point.
+
+        Delegates to ``run_async`` via ``any_llm.utils.aio.run_async_in_sync``,
+        which dispatches the inner coroutine onto a worker thread that owns
+        a private event loop. Before delegating, the wrapper pins that loop
+        on the callback registry as ``self._callbacks._loop`` so:
+
+          - ``dispatch_sync`` can bridge async hooks to the pinned loop via
+            ``asyncio.run_coroutine_threadsafe`` (round-2 M3 fix: async
+            hooks MUST be awaited, never silently dropped).
+          - ``dispatch_async`` runs against the same loop the worker
+            thread is driving, so awaiting a coroutine hook completes
+            promptly without cross-thread round trips.
+
+        The pinned loop is cleared in a ``finally`` so a partially-failed
+        ``run()`` (e.g. ``AgentCancel``) does not leak loop state into
+        the next call.
+
+        Per plan §5 contract: sync hooks always work (called inline by
+        dispatch), async hooks always work (bridged via the pinned loop),
+        ``AgentCancel`` propagates from any hook to the caller unchanged.
+        """
+        from any_llm.utils import aio as _any_llm_aio
+
+        async def _runner() -> str:
+            # Pin the worker-thread's event loop onto the registry so
+            # ``dispatch_sync`` can bridge async hooks to it via
+            # ``asyncio.run_coroutine_threadsafe``. ``get_event_loop()``
+            # inside this coroutine returns the loop the worker thread
+            # is running (see plan §5).
+            self._callbacks._loop = asyncio.get_event_loop()
+            try:
+                return await self.run_async(prompt, **kwargs)
+            finally:
+                # Always clear so a subsequent run() can re-pin cleanly
+                # and so the registry is left in its prior state if the
+                # caller kept a reference (test pins this contract).
+                self._callbacks._loop = None
+
+        coro: Coroutine[Any, Any, str] = _runner()
+        return _any_llm_aio.run_async_in_sync(coro)
+
 
 # Re-export `add_mcp_server` at module level for `from tinyagent import add_mcp_server`.
 add_mcp_server = TinyAgent.add_mcp_server  # type: ignore[attr-defined]
