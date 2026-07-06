@@ -111,7 +111,9 @@ DEFAULT_REQUEST_TIMEOUT_S: float = 120.0
 SPAN_LIMITS: dict[str, int] = {}  # populated in T9
 
 # LOCAL_PROVIDERS: providers whose cost is never recorded on the span (M6 round-2).
-LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama"})
+# T2 spec: must include ollama, vllm, and local — these are self-hosted providers
+# with no per-token pricing; the cost attribute is omitted (None), not $0.00.
+LOCAL_PROVIDERS: frozenset[str] = frozenset({"ollama", "vllm", "local"})
 
 # PROVIDER_KEY_ENV: any-llm env var lookup per provider. Always access via
 # PROVIDER_KEY_ENV.get(provider, ()) so ollama / vertex (no key required) don't
@@ -135,6 +137,9 @@ PROVIDER_EXTRA_ENV: dict[str, tuple[str, ...]] = {
 # =====================================================================
 # Section 5 - Pricing table (DEFAULT_PRICING) and lookup rules
 # =====================================================================
+# DEFAULT_PRICING: per-1M-token USD, (input, output). Sourced from published
+# provider pricing as of 2026-07-06. Maintained via PR, not runtime. See
+# plan §2 section 5 and §7 for the canonical lookup algorithm.
 DEFAULT_PRICING: dict[str, tuple[float, float]] = {
     "openai:gpt-4o": (2.50, 10.00),
     "openai:gpt-4o-mini": (0.15, 0.60),
@@ -146,6 +151,66 @@ DEFAULT_PRICING: dict[str, tuple[float, float]] = {
     "mistral:mistral-large": (2.0, 6.0),
     "groq:llama-3.1-70b": (0.59, 0.79),
 }
+
+# PRICING_OVERRIDE: user-supplied per-call table that wins over DEFAULT_PRICING.
+# Users mutate this dict directly (e.g. `tinyagent.PRICING_OVERRIDE["openai:gpt-4o"] = (0.0, 0.0)`)
+# to override pricing for one model. The override dict is matched longest-prefix
+# the same way DEFAULT_PRICING is, so partial keys like "openai:gpt-4o" cover
+# dated variants. Empty by default; populated by the user at runtime. T13 wires
+# an AgentConfig.pricing dict that copies into this module-level override per
+# agent instance.
+PRICING_OVERRIDE: dict[str, tuple[float, float]] = {}
+
+
+def _estimate_cost(
+    model_id: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> float | None:
+    """Estimate USD cost for an LLM call. Returns None when price is unknown.
+
+    Lookup order (CANONICAL — plan §7):
+      1. Local provider? -> None (no per-token price for self-hosted).
+      2. Longest-prefix match in PRICING_OVERRIDE (wins over DEFAULT_PRICING).
+      3. Longest-prefix match in DEFAULT_PRICING.
+      4. Otherwise -> None. NEVER return 0.00 for an unknown model.
+
+    Pricing tuples are (input_usd_per_1m, output_usd_per_1m). USD formula:
+        cost = (prompt_tokens / 1_000_000) * input_price
+             + (completion_tokens / 1_000_000) * output_price
+
+    Args:
+        model_id: The full model string, e.g. "openai:gpt-4o-2024-05-13".
+        prompt_tokens: Number of input tokens consumed.
+        completion_tokens: Number of output tokens generated.
+
+    Returns:
+        USD cost as a float, or None when price is unknown.
+    """
+    # 1. Local provider short-circuit.
+    provider = model_id.partition(":")[0]
+    if provider in LOCAL_PROVIDERS:
+        return None
+
+    # 2+3. Longest-prefix match against override first, then defaults.
+    # Sort keys descending by length so the longest match wins deterministically.
+    def _longest_match(table: dict[str, tuple[float, float]]) -> tuple[float, float] | None:
+        best_key: str | None = None
+        for key in table:
+            if model_id.startswith(key) and (best_key is None or len(key) > len(best_key)):
+                best_key = key
+        if best_key is None:
+            return None
+        return table[best_key]
+
+    pricing_tuple = _longest_match(PRICING_OVERRIDE) or _longest_match(DEFAULT_PRICING)
+    if pricing_tuple is None:
+        return None
+
+    input_price_per_1m, output_price_per_1m = pricing_tuple
+    return (prompt_tokens / 1_000_000) * input_price_per_1m + (
+        completion_tokens / 1_000_000
+    ) * output_price_per_1m
 
 
 # =====================================================================
