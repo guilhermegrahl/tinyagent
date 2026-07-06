@@ -122,3 +122,7 @@ Thumbs.db
 # Project-local sandbox
 .claude/
 .harness/
+
+# Test artifacts (regenerated on every pytest run)
+test-results.txt
+.pytest_cache/
