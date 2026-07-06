@@ -77,6 +77,10 @@ import any_llm
 import pydantic
 from pydantic import BaseModel, ConfigDict, Field
 
+# T5: simpleeval (calculate example tool) + httpx (http_get example tool)
+import httpx  # T5: http_get example tool
+import simpleeval  # T5: calculate example tool
+
 if TYPE_CHECKING:
     import mcp  # noqa: F401  # runtime import above
     from mcp.types import Tool as _MCPToolType
