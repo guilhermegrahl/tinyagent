@@ -1841,6 +1841,108 @@ class AgentConfig(BaseModel):
 
 
 # =====================================================================
+# Section 14b - Pruning helper (T12b: pair-preserving keep-last-N)
+# =====================================================================
+def _prune_messages_keeping_pairs(
+    messages: list[dict[str, Any]], keep_last_n: int
+) -> list[dict[str, Any]]:
+    """Prune ``messages`` to ``system + last keep_last_n paired units``.
+
+    Per plan §2 section 14 / §9 algorithm / §13 T12b (round-2 M5 fix).
+
+    A "unit" is one ``assistant`` message plus ALL of its follow-up
+    ``tool`` messages. The system message (when present, always first)
+    is preserved at index 0 and never counted against ``keep_last_n``.
+    The function walks the body RIGHT-to-LEFT accumulating whole units
+    until ``keep_last_n`` units have been collected; leftover leading
+    units are dropped WITHOUT splitting — a tool message never survives
+    without its parent assistant.
+
+    Args:
+        messages: The conversation history (mutually-exclusive dicts in
+            the canonical ``openai`` / ``anthropic`` shape: keys are
+            ``role``, ``content``, optional ``tool_call_id`` /
+            ``tool_calls``).
+        keep_last_n: How many trailing units to keep (after dropping
+            earlier ones). ``0`` keeps only the system message.
+
+    Returns:
+        A NEW list referencing the same dict instances that survived.
+        The input list is NOT mutated. Empty history is a no-op
+        (returns ``[]``).
+
+    Invariant (round-2 M5 — central correctness condition):
+        For every tool-role message in the result, its parent
+        ``assistant`` message (with matching ``tool_call_id``) is also
+        in the result. The provider-level pairing check passes.
+    """
+    if not messages:
+        return messages
+    has_system: bool = messages[0].get("role") == "system"
+    body: list[dict[str, Any]] = (
+        list(messages[1:]) if has_system else list(messages)
+    )
+
+    # Walk body from the right; collect whole (assistant, [tool, ...])
+    # units until reaching ``keep_last_n`` total. A unit is never split.
+    units: list[list[dict[str, Any]]] = []
+    i: int = len(body) - 1
+    while i >= 0 and len(units) < keep_last_n:
+        msg = body[i]
+        role = msg.get("role")
+        if role == "tool":
+            # Walk LEFTWARD collecting adjacent tool messages, then
+            # the assistant with matching tool_calls that generated
+            # them. The assistant is the unit's anchor: capture it
+            # along with all its tool follow-ups as one unit.
+            cluster: list[dict[str, Any]] = []
+            j: int = i
+            while j >= 0 and body[j].get("role") == "tool":
+                cluster.append(body[j])
+                j -= 1
+            if (
+                j >= 0
+                and body[j].get("role") == "assistant"
+                and body[j].get("tool_calls")
+            ):
+                cluster.append(body[j])
+                j -= 1
+            cluster.reverse()
+            units.append(cluster)
+            i = j
+        elif role == "assistant":
+            # Assistant with no tool_calls — standalone unit
+            # (plan §8 trailing-text fallback case).
+            units.append([msg])
+            i -= 1
+        else:
+            # user / system / anything else — standalone unit.
+            units.append([msg])
+            i -= 1
+
+    # Right-to-left accumulation produced units in tail-first order;
+    # reverse to recover chronological order before flattening.
+    units.reverse()
+    pruned_body: list[dict[str, Any]] = [m for unit in units for m in unit]
+
+    # Debug observability: surface drops when callers turned verbose
+    # logging on. Won't fire when the body fit within keep_last_n.
+    if pruned_body and logger.isEnabledFor(logging.DEBUG):
+        original_len = len(body)
+        kept_len = len(pruned_body)
+        if kept_len < original_len:
+            logger.debug(
+                "tinyagent.prune: dropped %d earlier messages, kept %d "
+                "(keep_last_n=%d)",
+                original_len - kept_len,
+                kept_len,
+                keep_last_n,
+            )
+
+    return ([messages[0]] if has_system else []) + pruned_body
+
+
+# =====================================================================
 # Section 15 - TinyAgent class
 # =====================================================================
 class TinyAgent:
