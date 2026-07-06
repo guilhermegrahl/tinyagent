@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinyagent"
+version = "0.1.0"
+description = "A single-file ReAct agent forked from mozilla-ai/tinyagent (Apache-2.0)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "tinyagent authors" },
+]
+keywords = [
+    "agent",
+    "react",
+    "mcp",
+    "model-context-protocol",
+    "any-llm",
+    "opentelemetry",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# T1: dependency pins are tightened in T15a. The stub-module imports below are
+# declared so `pip install -e .` works against the flat py-modules layout, but
+# they are NOT exercised at T1 import time (heavy imports live under
+# TYPE_CHECKING in tinyagent.py and are promoted to runtime as their respective
+# modules land in T2+).
+dependencies = [
+    "any-llm-sdk>=1.16,<1.20",
+    "mcp==1.28.1",
+    "opentelemetry-api>=1.27.0",
+    "pydantic>=2.5",
+    "simpleeval>=1.0",
+    "httpx>=0.27",
+    "typing-extensions>=4.0",
+]
+
+[project.urls]
+"Source" = "https://github.com/mozilla-ai/tinyagent"
+"Upstream fork of" = "https://github.com/mozilla-ai/tinyagent"
+
+# ----------------------------------------------------------------------
+# Flat-module layout (round-3 §0 C6 / minor m7):
+# tinyagent.py lives at the repo root, NOT under src/. setuptools looks
+# for "tinyagent" (without extension) at the project root by default.
+# No package-dir, no packages.find, no src/ — single source of truth.
+# ----------------------------------------------------------------------
+[tool.setuptools]
+py-modules = ["tinyagent"]
+
+# ----------------------------------------------------------------------
+# Dev tooling — T1 doesn't run these, but the config is committed so
+# downstream tasks (T2+) inherit a consistent lint/type surface.
+# ----------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-select = ["ALL"]
+# E501 (line length) is enforced by the formatter-style.
+ignore = [
+    "D",        # docstring rules relaxed for stub code; full rollout in T9+
+    "COM812",   # conflicts with formatter
+    "ISC001",   # conflicts with formatter
+    "PLR0913",  # too many arguments is fine for a single-file runtime
+    "TRY003",   # long messages inside raise are OK
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "D", "ARG"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+# Add the project root to sys.path so `import tinyagent` resolves against the
+# flat-layout repo-root module (no src/, no `pip install -e .` required for
+# the test suite). Matches plan §3 flat-module layout.
+pythonpath = ["."]
+]
