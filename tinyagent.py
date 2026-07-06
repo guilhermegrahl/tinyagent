@@ -42,6 +42,7 @@ import logging
 import os  # noqa: F401
 import re  # noqa: F401
 import types as _types  # T10: TracebackType for __aexit__ signature
+from types import SimpleNamespace  # T12a: Context is a SimpleNamespace — see §2 section 8
 import uuid  # noqa: F401
 import warnings  # noqa: F401
 from typing import (
@@ -424,6 +425,26 @@ class CallbackRegistry:
                 future.result()
 
     # ------------------------------------------------------------------
+    # Dispatch — async entry point (used from the agent loop body — T12a)
+    # ------------------------------------------------------------------
+    async def dispatch_async(self, name: str, ctx: object) -> None:
+        """Await async hooks directly; sync hooks run inline.
+
+        Used by ``TinyAgent.run_async`` (and any other async caller).
+        Iterates ``self._hooks.get(name, ())`` and invokes each hook with
+        ``ctx``. Coroutine return values are awaited on the caller's
+        loop; the dispatch helper never silently drops a coroutine — the
+        round-1 peer-review C7 bug is closed here.
+
+        Returns ``None``. Errors raised by hooks are propagated to the
+        caller; ``AgentCancel`` and other exceptions are NOT caught.
+        """
+        for hook in self._hooks.get(name, ()):
+            result = hook(ctx)
+            if asyncio.iscoroutine(result):
+                await result
+
+    # ------------------------------------------------------------------
     # Internal — single coroutine-await helper used by run_coroutine_threadsafe
     # ------------------------------------------------------------------
     async def _await_coro(self, coro: Coroutine[Any, Any, object]) -> object:
@@ -467,8 +488,51 @@ class ToolCall(TypedDict):
     function: dict[str, Any]
 
 
-class Context:
-    """Stub for T1; full Context lands in T7 (SimpleNamespace-like)."""
+class Context(SimpleNamespace):
+    """Hook context passed to every callback (plan §2 section 8, §5).
+
+    Fields are populated selectively by the loop based on the hook name:
+
+    - ``agent: TinyAgent`` — set on every hook (the agent the loop belongs to).
+    - ``span: Any`` — the active OTel span (set by the loop / span-generation).
+    - ``trace: AgentTrace | None`` — top-level trace collector (set per run).
+    - ``message: Any`` — populated on LLM hooks (``before_llm_call`` /
+      ``after_llm_call``) with the model response message.
+    - ``tool_call: ToolCall | None`` — populated on tool hooks
+      (``before_tool_execution`` / ``after_tool_execution``) with the
+      tool call being executed.
+    - ``tool_result: Any`` — populated on ``after_tool_execution`` with
+      the result string the loop will feed back to the LLM. For
+      ``final_answer`` this is the captured answer.
+    - ``error: BaseException | None`` — populated on ``on_error`` with
+      the escaping exception.
+    - ``turn: int`` — current turn index (0-based).
+
+    Unused fields stay at their default (``None`` for object fields).
+    """
+
+    def __init__(
+        self,
+        *,
+        agent: Any = None,
+        span: Any = None,
+        trace: Any = None,
+        tool_call: Any = None,
+        tool_result: Any = None,
+        message: Any = None,
+        error: BaseException | None = None,
+        turn: int = 0,
+    ) -> None:
+        super().__init__(
+            agent=agent,
+            span=span,
+            trace=trace,
+            tool_call=tool_call,
+            tool_result=tool_result,
+            message=message,
+            error=error,
+            turn=turn,
+        )
 
 
 # =====================================================================
@@ -755,7 +819,6 @@ _HTTP_GET_TRUNCATION_MARKER: str = "...[truncated]"
 
 
 def final_answer(answer: str) -> str:
-<<<<<<< HEAD
     """Bare termination tool: the agent loop returns ``answer`` as the run's result.
 
     The function body is a no-op identity: it does not evaluate, parse,
@@ -777,16 +840,6 @@ def final_answer(answer: str) -> str:
     Returns
     -------
     The ``answer`` argument, unchanged.
-=======
-    """Bare termination tool: model calls this to end the loop cleanly.
-
-    Returns the answer verbatim. The agent's loop (T12a) inspects
-    ``ctx.tool_call.function.name == "final_answer"`` BEFORE invoking
-    the function and captures ``answer`` as the agent's return value;
-    the return value of this function is mostly for type consistency
-    (it's discarded by the loop). Per plan §2 section 10: bare
-    function, no eval, no validation.
->>>>>>> worktree-agent-af4a666420bdabc97
     """
     return answer
 
@@ -1929,6 +1982,340 @@ class TinyAgent:
         with span_gen.call_llm(response):
             pass
         return response
+
+    # ------------------------------------------------------------------
+    # Tool dispatch (helper used by the loop body below)
+    # ------------------------------------------------------------------
+    async def _dispatch_tool(self, tool_call: Any) -> Any:
+        """Invoke the tool registered under ``tool_call.function.name``.
+
+        Resolves the tool name against ``self._clients``, parses the
+        JSON-encoded argument string, and invokes the tool with the
+        resulting kwargs. Sync tools are awaited via ``asyncio.to_thread``
+        (so a slow blocking tool doesn't stall the event loop); async
+        tools are awaited directly.
+
+        Returns whatever the tool returns; the loop coerces the value to
+        ``str`` when feeding it back to the LLM.
+
+        Raises ``ToolNotFoundError`` when the tool name is not
+        registered; ``ValueError`` when the argument JSON cannot be
+        parsed; any other exception raised by the tool itself
+        propagates (the loop does not mask it — T12d wires
+        ``on_error``/AgentError for that path).
+        """
+        tool_name: str = tool_call.function.name
+        if tool_name not in self._clients:
+            raise ToolNotFoundError(
+                f"tool {tool_name!r} is not registered; "
+                f"available tools: {sorted(self._clients)}"
+            )
+        fn = self._clients[tool_name]
+        raw_args = tool_call.function.arguments
+        # The argument string from a chat-completion tool call is JSON.
+        # An empty string is treated as "no arguments" so a model that
+        # emits ``arguments=""`` for an arg-less tool doesn't crash.
+        if raw_args:
+            try:
+                parsed = json.loads(raw_args)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"tool {tool_name!r}: invalid JSON arguments {raw_args!r}: {exc}"
+                ) from exc
+        else:
+            parsed = {}
+        if not isinstance(parsed, dict):
+            # OpenAI tool arguments must be a JSON object. Anything else
+            # is a model bug we surface rather than silently coerce.
+            raise ValueError(
+                f"tool {tool_name!r}: arguments must be a JSON object, got {type(parsed).__name__}"
+            )
+        kwargs = parsed
+
+        if asyncio.iscoroutinefunction(fn):
+            return await fn(**kwargs)
+        # Sync tool — offload to a worker thread to avoid blocking the loop.
+        return await asyncio.to_thread(fn, **kwargs)
+
+    # ------------------------------------------------------------------
+    # ReAct loop body — helpers (T12a — §2 section 15, §13 T12a acceptance
+    # criteria). The helpers are factored out so ``run_async`` stays under
+    # the ruff C901 complexity budget.
+    # ------------------------------------------------------------------
+    def _initial_messages(self, prompt: str) -> list[dict[str, Any]]:
+        """Build the initial ``messages`` list (system + user)."""
+        messages: list[dict[str, Any]] = []
+        if self.config.instructions:
+            messages.append(
+                {"role": "system", "content": self.config.instructions}
+            )
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    @staticmethod
+    def _is_empty_response(message: Any) -> bool:
+        """Return ``True`` for a response with no tool_calls and no content."""
+        return not bool(message.tool_calls) and not bool(
+            message.content and message.role == "assistant"
+        )
+
+    async def _capture_final_answer(
+        self, tool_call: Any, turn: int
+    ) -> str:
+        """Run the M4-symmetric hook sequence for a ``final_answer`` tool call.
+
+        Fires ``before_tool_execution``, parses ``answer`` from the
+        arguments, fires ``after_tool_execution`` with ``tool_result`` set
+        to the answer string, and returns the captured value. The
+        ``break`` that follows in the caller's loop uses this return to
+        decide whether to short-circuit the rest of the turn.
+        """
+        await self._callbacks.dispatch_async(
+            "before_tool_execution",
+            Context(agent=self, tool_call=tool_call, turn=turn),
+        )
+        answer = self._extract_final_answer_arg(tool_call)
+        await self._callbacks.dispatch_async(
+            "after_tool_execution",
+            Context(
+                agent=self,
+                tool_call=tool_call,
+                tool_result=answer,
+                turn=turn,
+            ),
+        )
+        return answer
+
+    @staticmethod
+    def _extract_final_answer_arg(tool_call: Any) -> str:
+        """Parse the ``answer`` argument out of a ``final_answer`` tool call.
+
+        Defensive against malformed JSON or non-dict arguments — the
+        loop can recover from either and let the LLM self-correct on
+        the next turn.
+        """
+        raw = tool_call.function.arguments
+        if not raw:
+            return ""
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return ""
+        if not isinstance(parsed, dict):
+            return str(parsed)
+        return str(parsed.get("answer", ""))
+
+    async def _execute_non_final_tool_call(
+        self, tool_call: Any, turn: int
+    ) -> str:
+        """Run a non-``final_answer`` tool call: dispatch, then return result string.
+
+        Returns the tool result coerced to ``str`` (the form the loop
+        feeds back to the LLM as the tool-role message content). A
+        ``ToolNotFoundError`` is caught and translated to a descriptive
+        error string so the LLM can self-correct; ``on_error`` does NOT
+        fire — the rule (d) contract from plan §8.
+        """
+        await self._callbacks.dispatch_async(
+            "before_tool_execution",
+            Context(agent=self, tool_call=tool_call, turn=turn),
+        )
+        try:
+            result: Any = await self._dispatch_tool(tool_call)
+        except ToolNotFoundError as exc:
+            result = (
+                f"error: {exc}; available tools: "
+                f"{sorted(self._clients)}"
+            )
+        result_str = str(result)
+        await self._callbacks.dispatch_async(
+            "after_tool_execution",
+            Context(
+                agent=self,
+                tool_call=tool_call,
+                tool_result=result_str,
+                turn=turn,
+            ),
+        )
+        return result_str
+
+    # ------------------------------------------------------------------
+    # ReAct loop body (T12a — §2 section 15, §13 T12a acceptance criteria)
+    # ------------------------------------------------------------------
+    async def run_async(self, prompt: str, **kwargs: Any) -> str:
+        """Drive the ReAct loop and return the agent's final answer.
+
+        Loop structure (per plan §8 pseudocode + cross-cutting risks #7
+        and #11):
+
+          1. Build the initial messages list with the system prompt and
+             the user's prompt.
+          2. ``tool_choice_for_next`` starts as ``"required"``; ``retried_with_auto``
+             tracks whether the current turn has already retried once
+             under ``"auto"`` (round-3 M4).
+          3. For each turn (up to ``config.max_turns``):
+              a. Fire ``before_llm_call``; call ``self.call_model``.
+              b. Fire ``after_llm_call``; classify the response.
+              c. If empty AND under ``"required"`` AND not-yet-retried,
+                 switch to ``"auto"`` and retry THIS turn.
+              d. If empty after retry, raise ``AgentError``.
+              e. Append the (non-empty) assistant message to ``messages``.
+              f. If no tool_calls, return trailing assistant text.
+              g. Iterate tool_calls. ``before_tool_execution`` /
+                 ``after_tool_execution`` fire on EVERY tool call,
+                 including ``final_answer`` (round-3 M4 closure).
+              h. The first ``final_answer`` short-circuits via ``break``
+                 (round-3 M1) — subsequent tool calls in the turn do
+                 NOT execute.
+              i. Non-``final_answer`` tool calls: dispatch via
+                 ``_dispatch_tool``; on ``ToolNotFoundError`` feed a
+                 descriptive error string to the LLM (recoverable, no
+                 ``on_error`` fires).
+              j. Return ``final_answer_value`` when ``seen_final_answer``.
+          4. If the turn budget is exhausted, raise ``AgentError``.
+
+        The ``tool_choice`` retry is driven per turn: each new turn
+        re-arms the retry counter, so a long conversation can do at
+        most one retry per turn. The retry counts toward ``max_turns``
+        (so the worst case is ``2 * max_turns`` LLM calls).
+        """
+        messages = self._initial_messages(prompt)
+
+        # --- Per-turn tool_choice retry state (round-3 M4) ---
+        tool_choice_for_next: str = "required"
+        retried_with_auto: bool = False
+
+        turn: int = 0
+        while turn < self.config.max_turns:
+            message = await self._llm_step(
+                messages, tool_choice_for_next, turn, kwargs
+            )
+            empty_response = self._is_empty_response(message)
+
+            # d. Round-3 M4: retry once under "auto".
+            if (
+                empty_response
+                and tool_choice_for_next == "required"
+                and not retried_with_auto
+            ):
+                retried_with_auto = True
+                tool_choice_for_next = "auto"
+                # The empty message is NOT appended; the retry result
+                # is the one we keep (or the error we raise).
+                continue
+
+            # e. Empty after retry (or directly empty under auto): bail.
+            if empty_response:
+                _empty_msg = (
+                    "model returned no tool calls and no assistant text under "
+                    "tool_choice=required (retried once with tool_choice=auto)"
+                )
+                raise AgentError(_empty_msg)
+
+            # f. Successful response — reset retry state for the next turn.
+            tool_choice_for_next = "required"
+            retried_with_auto = False
+            messages.append(message.model_dump())
+
+            # g. Trailing-text fallback (no tool_calls).
+            if not message.tool_calls:
+                return str(message.content or "")
+
+            # h+i. Iterate tool_calls. The first ``final_answer`` short-circuits.
+            final_value = await self._run_tool_calls(message, messages, turn)
+            if final_value is not None:
+                return final_value
+
+            # Pruning is owned by T12b (pair-preserving). T12a leaves the
+            # messages list intact end-of-turn so tests can assert on the
+            # exact construction without surprise mutation.
+
+            turn += 1
+
+        # Out of turns.
+        _max_turns_msg = (
+            f"max_turns={self.config.max_turns} exceeded without a final_answer"
+        )
+        raise AgentError(_max_turns_msg)
+
+    async def _llm_step(
+        self,
+        messages: list[dict[str, Any]],
+        tool_choice: str,
+        turn: int,
+        completion_kwargs: dict[str, Any],
+    ) -> Any:
+        """Run one LLM step: dispatch hooks around ``self.call_model``.
+
+        Returns ``response.choices[0].message``. The caller appends to
+        ``messages`` and decides what to do with the result.
+        """
+        llm_ctx = Context(agent=self, turn=turn)
+        await self._callbacks.dispatch_async("before_llm_call", llm_ctx)
+        response = await self.call_model(
+            model=self.config.model,
+            messages=list(messages),
+            tool_choice=tool_choice,
+            **completion_kwargs,
+        )
+        llm_ctx.message = response
+        await self._callbacks.dispatch_async("after_llm_call", llm_ctx)
+        return response.choices[0].message
+
+    async def _run_tool_calls(
+        self,
+        message: Any,
+        messages: list[dict[str, Any]],
+        turn: int,
+    ) -> str | None:
+        """Iterate ``message.tool_calls``; return ``final_answer`` or ``None``.
+
+        Appends tool-role messages to ``messages`` in place for every
+        non-``final_answer`` call. The first ``final_answer`` short-
+        circuits via ``break`` (round-3 M1); its captured value is
+        returned. A ``None`` return means "no final_answer this turn;
+        keep iterating".
+        """
+        seen_final_answer = False
+        final_answer_value: str | None = None
+
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+
+            # M4 symmetry: BOTH hooks fire on final_answer (no carve-out).
+            if tool_name == "final_answer" and not seen_final_answer:
+                final_answer_value = await self._capture_final_answer(
+                    tool_call, turn
+                )
+                seen_final_answer = True
+                break  # <-- round-3 M1: short-circuit the rest of the turn
+
+            # Defensive branch: a second ``final_answer`` in the same turn
+            # after we've already captured one. Unreachable in normal flow
+            # thanks to the ``break`` above, kept for test synthesis.
+            if tool_name == "final_answer":
+                warnings.warn(
+                    f"model emitted a second final_answer in the same turn; "
+                    f"skipping tool_call_id={tool_call.id}",
+                    stacklevel=2,
+                )
+                continue
+
+            # Non-final_answer tool call.
+            result_str = await self._execute_non_final_tool_call(
+                tool_call, turn
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result_str,
+                }
+            )
+
+        if seen_final_answer:
+            return final_answer_value or ""
+        return None
 
     async def add_mcp_server(self, server: Any) -> Any:
         """Stub: returns an async context manager of synthesised tools. Lands in T14."""
