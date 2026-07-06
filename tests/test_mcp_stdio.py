@@ -377,3 +377,202 @@ def _pid_alive(pid: int) -> bool:
         # (testing our own subprocess) this means it's alive.
         return True
     return True
+
+
+# =====================================================================
+# Section 7 - ``TinyAgent.add_mcp_server`` ergonomic API (T14)
+# =====================================================================
+def test_add_mcp_server_is_in_module_all() -> None:
+    """``add_mcp_server`` is exported in ``tinyagent.__all__``.
+
+    The symbol is exposed at module level for ``from tinyagent import
+    add_mcp_server`` discoverability. The task description's acceptance
+    criteria require both forms: name in ``__all__`` AND importable.
+    """
+    assert "add_mcp_server" in tinyagent.__all__
+
+
+def test_add_mcp_server_top_level_import_resolves_to_method() -> None:
+    """``from tinyagent import add_mcp_server`` resolves to ``TinyAgent.add_mcp_server``.
+
+    Module-level re-export (per T1 stub): the symbol is bound to the
+    same function object on the class so users can write ``add_mcp_server``
+    for type hints while the runtime contract lives on the instance.
+    The check uses the already-imported ``tinyagent`` module to avoid
+    a local re-import.
+    """
+    assert tinyagent.add_mcp_server is tinyagent.TinyAgent.add_mcp_server
+
+
+def _make_minimal_agent() -> tinyagent.TinyAgent:
+    """Build a ``TinyAgent`` with no MCP servers for in-test usage.
+
+    The model string is arbitrary — T14 only exercises the MCP
+    bookkeeping path; no LLM calls happen in these tests. Using
+    ``openai:gpt-4o-mini`` keeps the constructor happy without
+    requiring a real provider key (the placeholder API key in
+    ``TinyAgent.__init__`` satisfies the any-llm client construction).
+    """
+    config = tinyagent.AgentConfig(
+        instructions="x",
+        tools=[],
+        mcp_servers=[],
+        model="openai:gpt-4o-mini",
+    )
+    return tinyagent.TinyAgent(config)
+
+
+@pytest.mark.skipif(
+    not _FIXTURE_SCRIPT.exists(),
+    reason="examples/inproc_mcp_echo.py fixture missing",
+)
+def test_add_mcp_server_async_cm_populates_clients_on_enter() -> None:
+    """``async with agent.add_mcp_server(server) as tools:`` populates ``_clients``.
+
+    Form A (the context-manager form, preferred for multi-server sessions,
+    plan §10): entering the block calls ``server.connect()`` and inserts
+    each synthesised tool into ``agent._clients`` keyed by tool name. The
+    yielded value is the list of synthesised callables.
+    """
+    agent = _make_minimal_agent()
+    server = tinyagent.MCPServer(
+        name="inproc",
+        command=sys.executable,
+        args=[str(_FIXTURE_SCRIPT)],
+    )
+
+    async def _runner() -> None:
+        async with agent.add_mcp_server(server) as tools:
+            # The synthesised tools from the fixture (``echo``, ``add``)
+            # are now registered on the agent.
+            assert "echo" in agent._clients  # noqa: SLF001 - intentional test access
+            assert "add" in agent._clients  # noqa: SLF001
+            # The yielded value is a non-empty list of callables.
+            assert isinstance(tools, list)
+            assert tools, "yields list of synthesised tools must be non-empty"
+            assert all(callable(fn) for fn in tools)
+            # final_answer is still present (was seeded by the constructor).
+            assert "final_answer" in agent._clients  # noqa: SLF001
+
+    asyncio.run(_runner())
+
+
+@pytest.mark.skipif(
+    not _FIXTURE_SCRIPT.exists(),
+    reason="examples/inproc_mcp_echo.py fixture missing",
+)
+def test_add_mcp_server_async_cm_removes_clients_and_kills_subprocess_on_exit() -> None:
+    """On exit, ``add_mcp_server`` removes tools from ``_clients`` and cleans up the subprocess.
+
+    Plan §10 Form A — exit semantics: the synthesised tools must be
+    removed from ``_clients`` (so a subsequent ``run_async`` would not
+    accidentally invoke a server that no longer exists) and the
+    subprocess must be terminated. We assert both: the names are gone
+    from ``_clients``, and the captured PID is no longer alive.
+    """
+    agent = _make_minimal_agent()
+    server = tinyagent.MCPServer(
+        name="inproc",
+        command=sys.executable,
+        args=[str(_FIXTURE_SCRIPT)],
+    )
+    pid_holder: dict[str, int] = {}
+
+    async def _runner() -> None:
+        async with agent.add_mcp_server(server) as _tools:
+            # Capture the live subprocess PID before exiting the block.
+            pid_holder["pid"] = server._process.pid  # noqa: SLF001 - test access
+            assert _pid_alive(pid_holder["pid"])
+            assert "echo" in agent._clients  # noqa: SLF001
+
+    asyncio.run(_runner())
+
+    # After exit: tools removed and subprocess is dead.
+    assert "echo" not in agent._clients  # noqa: SLF001
+    assert "add" not in agent._clients  # noqa: SLF001
+    # final_answer remains (constructor-seeded, untouched by the CM).
+    assert "final_answer" in agent._clients  # noqa: SLF001
+    assert not _pid_alive(pid_holder["pid"]), (
+        f"subprocess {pid_holder['pid']} should be dead after add_mcp_server exit"
+    )
+
+
+@pytest.mark.skipif(
+    not _FIXTURE_SCRIPT.exists(),
+    reason="examples/inproc_mcp_echo.py fixture missing",
+)
+def test_add_mcp_server_explicit_aenter_aexit_form_works() -> None:
+    """Explicit register/cleanup form via ``__aenter__`` / ``__aexit__`` works.
+
+    Plan §10 Form B (the explicit form, used when callers prefer manual
+    control over the lifecycle). The same async-CM object returned by
+    ``add_mcp_server(server)`` is driven via its ``__aenter__`` and
+    ``__aexit__`` methods directly. After exit, both the ``_clients``
+    state and the subprocess are cleaned up.
+    """
+    agent = _make_minimal_agent()
+    server = tinyagent.MCPServer(
+        name="inproc",
+        command=sys.executable,
+        args=[str(_FIXTURE_SCRIPT)],
+    )
+    pid_holder: dict[str, int] = {}
+
+    async def _runner() -> None:
+        cm = agent.add_mcp_server(server)
+        await cm.__aenter__()
+        try:
+            assert "echo" in agent._clients  # noqa: SLF001
+            assert "add" in agent._clients  # noqa: SLF001
+            pid_holder["pid"] = server._process.pid  # noqa: SLF001
+            assert _pid_alive(pid_holder["pid"])
+        finally:
+            await cm.__aexit__(None, None, None)
+
+    asyncio.run(_runner())
+
+    # Same post-conditions as the `async with` form.
+    assert "echo" not in agent._clients  # noqa: SLF001
+    assert "add" not in agent._clients  # noqa: SLF001
+    assert not _pid_alive(pid_holder["pid"])
+
+
+@pytest.mark.skipif(
+    not _FIXTURE_SCRIPT.exists(),
+    reason="examples/inproc_mcp_echo.py fixture missing",
+)
+def test_add_mcp_server_cleanup_runs_even_on_exception_inside_block() -> None:
+    """If the body raises, the cleanup (``finally``) still runs.
+
+    Plan §10 Form A — the ``async with`` must guarantee subprocess
+    cleanup on any exit path, including raised exceptions inside the
+    block. We force a synthetic exception and assert the subprocess is
+    dead afterwards. Setup (PID capture) happens OUTSIDE the
+    ``pytest.raises`` block so the assertion contains a single
+    statement (PT012) — the captured PID is the side-effect we assert
+    against after the body unwinds.
+    """
+    agent = _make_minimal_agent()
+    server = tinyagent.MCPServer(
+        name="inproc",
+        command=sys.executable,
+        args=[str(_FIXTURE_SCRIPT)],
+    )
+    pid_holder: dict[str, int] = {}
+    boom_message = "boom"
+
+    async def _body() -> None:
+        async with agent.add_mcp_server(server) as _tools:
+            pid_holder["pid"] = server._process.pid  # noqa: SLF001
+            assert _pid_alive(pid_holder["pid"])
+            raise RuntimeError(boom_message)
+
+    async def _runner() -> None:
+        with pytest.raises(RuntimeError, match=boom_message):
+            await _body()
+
+    asyncio.run(_runner())
+
+    # Cleanup ran via the `finally` branch.
+    assert "echo" not in agent._clients  # noqa: SLF001
+    assert not _pid_alive(pid_holder["pid"])
