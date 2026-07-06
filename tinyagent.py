@@ -50,13 +50,18 @@ from typing import (
 
 from typing_extensions import TypeAlias  # used at type hints below
 
+# T8: opentelemetry-api is a hard dependency in pyproject.toml and _setup_tracing
+# (Section 13) is now in scope. Promote the runtime import so the function can
+# acquire tracers. Heavy third-party imports for sections still pending (T4+,
+# T10, T11+) remain under TYPE_CHECKING below.
+from opentelemetry import trace as _otel_trace  # used in §13
+
 if TYPE_CHECKING:
     import any_llm
     import httpx
     import mcp
     import pydantic
     import simpleeval
-    from opentelemetry import trace
     from mcp import ClientSession, StdioServerParameters  # noqa: F401
     from mcp.client.stdio import stdio_client  # noqa: F401
     from mcp.types import Tool as _MCPToolType
@@ -306,13 +311,56 @@ class AgentTrace:
 # =====================================================================
 # Section 13 - OpenTelemetry setup (library pattern, idempotent)
 # =====================================================================
-def _setup_tracing(name: str = "tinyagent") -> Any:
-    """Acquire the named tracer (library pattern).
+# Module-level cache keyed by tracer name. _setup_tracing() is idempotent
+# across calls: the same name returns the same tracer object reference.
+# Hosts that want a fresh tracer (e.g. after reconfiguring the global
+# TracerProvider) should call _setup_tracing.cache_clear() explicitly.
+_tracer_cache: dict[str, Any] = {}
 
-    Stub: full implementation lands in T8. Idempotent, does NOT call
-    trace.set_tracer_provider, does NOT configure exporters.
+
+def _setup_tracing(name: str = "tinyagent") -> Any:
+    """Acquire the named tracer using the library pattern (B1/B2 round-1 fix).
+
+    Idempotent — repeated calls with the same name return the SAME tracer
+    object (cached on the module). Does NOT call
+    ``opentelemetry.trace.set_tracer_provider``; that mutates the
+    process-wide TracerProvider singleton and would break multi-instance
+    use of the library plus any host application that already configured
+    a provider. Does NOT configure exporters; the host application is
+    responsible for installing a TracerProvider (e.g. via
+    ``opentelemetry-instrumentation`` autoconfigure, or manually) before
+    importing tinyagent or before calling ``agent.run()``.
+
+    If no TracerProvider is configured yet, ``trace.get_tracer`` returns a
+    NoOp tracer and this function returns it without raising — the agent
+    still runs correctly, just without spans emitted anywhere.
+
+    Parameters
+    ----------
+    name:
+        Tracer instrumentation name. Defaults to ``"tinyagent"`` (plan §2
+        section 13). Different names produce different tracer instances.
+
+    Returns
+    -------
+    An OpenTelemetry ``Tracer`` instance (real or NoOp). The exact type
+    is owned by opentelemetry-api and not asserted by this contract.
     """
-    raise NotImplementedError
+    cached = _tracer_cache.get(name)
+    if cached is not None:
+        return cached
+    tracer = _otel_trace.get_tracer(name)
+    _tracer_cache[name] = tracer
+    return tracer
+
+
+def _setup_tracing_cache_clear() -> None:
+    """Drop all cached tracers (test helper; not part of the public API).
+
+    Lets tests that reconfigure the global TracerProvider between cases
+    observe a fresh ``trace.get_tracer`` call.
+    """
+    _tracer_cache.clear()
 
 
 # =====================================================================
