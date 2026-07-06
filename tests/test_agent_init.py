@@ -383,9 +383,11 @@ async def test_call_model_opens_call_llm_span_with_response() -> None:
             )
             # Inside the context manager: _SpanGeneration is the
             # patched MagicMock; assert it was called with the agent's
-            # tracer and the configured model id.
+            # tracer and the configured model id. T13 added the
+            # ``pricing=`` kwarg for the per-instance override (None
+            # here because the test config does not supply one).
             tinyagent._SpanGeneration.assert_called_once_with(
-                agent._tracer, "openai:gpt-4o-mini"
+                agent._tracer, "openai:gpt-4o-mini", pricing=None
             )
             # And call_llm was called with the response from any_llm.acompletion.
             span_gen_instance.call_llm.assert_called_once_with(fake_response)
