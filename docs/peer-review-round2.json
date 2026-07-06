@@ -1,0 +1,21 @@
+{
+  "decision": "approve",
+  "summary": "Both round-1 blockers are properly fixed end-to-end: the OTel hierarchy now correctly emits invoke_agent as the parent of call_llm and execute_tool spans, and agent.trace returns a populated AgentTrace mirror of the OTel hierarchy. All 271 unit tests pass (268 prior + 3 new hierarchy tests). No new defects introduced. The fix is consistent with the rest of the codebase (hooks, callbacks, plan §6, plan §2 sections 13/15) and the README Tracing section already documents the new hierarchy.",
+  "round1_audit": [
+    {
+      "issue_id": "B1",
+      "status": "fixed",
+      "evidence": "/Users/guilhermegrahl/tinyagent/tinyagent.py:2550-2552 opens invoke_agent span via self._tracer.start_as_current_span(\"invoke_agent\", ...); _run_async_loop runs inside the with block so call_llm and execute_tool are its OTel children via context propagation. /Users/guilhermegrahl/tinyagent/tests/test_otel_hierarchy.py:172-252 asserts via InMemorySpanExporter that exactly 1 invoke_agent span is emitted, that all call_llm/execute_tool children have invoke_agent as parent (span.parent.span_id == invoke_agent.context.span_id), and that invoke_agent is the root (parent is None). All 3 tests in tests/test_otel_hierarchy.py pass; the 12 original OTel tests in tests/test_otel.py also pass unchanged."
+    },
+    {
+      "issue_id": "B2",
+      "status": "fixed",
+      "evidence": "/Users/guilhermegrahl/tinyagent/tinyagent.py:2203-2222 defines a `trace` property on TinyAgent returning self._trace (AgentTrace). /Users/guilhermegrahl/tinyagent/tinyagent.py:2201 initialises self._trace = AgentTrace(spans=[]) in __init__. /Users/guilhermegrahl/tinyagent/tinyagent.py:2536 resets self._trace at the start of every run_async. /Users/guilhermegrahl/tinyagent/tinyagent.py:2451-2462 in _execute_non_final_tool_call passes trace_collector=self._trace to _SpanGeneration, and /Users/guilhermegrahl/tinyagent/tinyagent.py:2272-2277 in call_model does the same. /Users/guilhermegrahl/tinyagent/tinyagent.py:1752-1797 _record_span mirrors every OTel span into trace_collector.spans; /Users/guilhermegrahl/tinyagent/tinyagent.py:2662-2685 _record_invoke_agent_span records the parent span. /Users/guilhermegrahl/tinyagent/tests/test_otel_hierarchy.py:259-348 asserts agent.trace returns a populated AgentTrace containing 1 invoke_agent, ≥1 call_llm, ≥1 execute_tool, and that the trace is reset between runs. /Users/guilhermegrahl/tinyagent/examples/tracing_otlp.py:141-159 demonstrates agent.trace access with token + cost roll-ups."
+    }
+  ],
+  "findings": [],
+  "blocker_count": 0,
+  "major_count": 0,
+  "minor_count": 0,
+  "ship_recommendation": "Ship. Both round-1 blockers are correctly fixed, the new tests genuinely exercise the hierarchy (not stubs), agent.trace returns meaningful data, and the fix is consistent with the rest of the codebase. The README Tracing section already documents the invoke_agent > call_llm/execute_tool hierarchy correctly. All 271 unit tests pass and no new defects were introduced. Pre-existing deprecation warnings for asyncio.iscoroutinefunction are unrelated to this fix (they predate the changes)."
+}
