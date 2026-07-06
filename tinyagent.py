@@ -2282,65 +2282,106 @@ class TinyAgent:
         re-arms the retry counter, so a long conversation can do at
         most one retry per turn. The retry counts toward ``max_turns``
         (so the worst case is ``2 * max_turns`` LLM calls).
+
+        Error propagation (T12d — §0 C1 round-1 closure, §5 contract):
+
+          - The whole loop body is wrapped in ``try / except AgentCancel /
+            except Exception``. ``AgentCancel`` propagates unchanged
+            (the user explicitly aborted; ``on_error`` does NOT fire).
+          - Any other escaping exception (including the ``AgentError``
+            raises for empty-after-retry and max-turns-exceeded) fires
+            ``on_error(ctx)`` with ``ctx.error`` populated, then
+            re-raises the ORIGINAL exception unchanged. ``on_error``
+            is observability-only — it cannot swallow the exception.
         """
-        messages = self._initial_messages(prompt)
-
-        # --- Per-turn tool_choice retry state (round-3 M4) ---
-        tool_choice_for_next: str = "required"
-        retried_with_auto: bool = False
-
+        # ``turn`` is declared up front so the ``except`` branch can
+        # populate ``Context.turn`` with a meaningful value even when
+        # the failure happens on the very first iteration (before any
+        # increment). The body assigns 0 here, then increments inside
+        # the loop.
         turn: int = 0
-        while turn < self.config.max_turns:
-            message = await self._llm_step(
-                messages, tool_choice_for_next, turn, kwargs
-            )
-            empty_response = self._is_empty_response(message)
+        try:
+            messages = self._initial_messages(prompt)
 
-            # d. Round-3 M4: retry once under "auto".
-            if (
-                empty_response
-                and tool_choice_for_next == "required"
-                and not retried_with_auto
-            ):
-                retried_with_auto = True
-                tool_choice_for_next = "auto"
-                # The empty message is NOT appended; the retry result
-                # is the one we keep (or the error we raise).
-                continue
+            # --- Per-turn tool_choice retry state (round-3 M4) ---
+            tool_choice_for_next: str = "required"
+            retried_with_auto: bool = False
 
-            # e. Empty after retry (or directly empty under auto): bail.
-            if empty_response:
-                _empty_msg = (
-                    "model returned no tool calls and no assistant text under "
-                    "tool_choice=required (retried once with tool_choice=auto)"
+            while turn < self.config.max_turns:
+                message = await self._llm_step(
+                    messages, tool_choice_for_next, turn, kwargs
                 )
-                raise AgentError(_empty_msg)
+                empty_response = self._is_empty_response(message)
 
-            # f. Successful response — reset retry state for the next turn.
-            tool_choice_for_next = "required"
-            retried_with_auto = False
-            messages.append(message.model_dump())
+                # d. Round-3 M4: retry once under "auto".
+                if (
+                    empty_response
+                    and tool_choice_for_next == "required"
+                    and not retried_with_auto
+                ):
+                    retried_with_auto = True
+                    tool_choice_for_next = "auto"
+                    # The empty message is NOT appended; the retry result
+                    # is the one we keep (or the error we raise).
+                    continue
 
-            # g. Trailing-text fallback (no tool_calls).
-            if not message.tool_calls:
-                return str(message.content or "")
+                # e. Empty after retry (or directly empty under auto): bail.
+                if empty_response:
+                    _empty_msg = (
+                        "model returned no tool calls and no assistant text under "
+                        "tool_choice=required (retried once with tool_choice=auto)"
+                    )
+                    raise AgentError(_empty_msg)  # noqa: TRY301 — intentional; on_error fires
 
-            # h+i. Iterate tool_calls. The first ``final_answer`` short-circuits.
-            final_value = await self._run_tool_calls(message, messages, turn)
-            if final_value is not None:
-                return final_value
+                # f. Successful response — reset retry state for the next turn.
+                tool_choice_for_next = "required"
+                retried_with_auto = False
+                messages.append(message.model_dump())
 
-            # Pruning is owned by T12b (pair-preserving). T12a leaves the
-            # messages list intact end-of-turn so tests can assert on the
-            # exact construction without surprise mutation.
+                # g. Trailing-text fallback (no tool_calls).
+                if not message.tool_calls:
+                    return str(message.content or "")
 
-            turn += 1
+                # h+i. Iterate tool_calls. The first ``final_answer`` short-circuits.
+                final_value = await self._run_tool_calls(message, messages, turn)
+                if final_value is not None:
+                    return final_value
 
-        # Out of turns.
-        _max_turns_msg = (
-            f"max_turns={self.config.max_turns} exceeded without a final_answer"
-        )
-        raise AgentError(_max_turns_msg)
+                # Pruning is owned by T12b (pair-preserving). T12a leaves the
+                # messages list intact end-of-turn so tests can assert on the
+                # exact construction without surprise mutation.
+
+                turn += 1
+
+            # Out of turns.
+            _max_turns_msg = (
+                f"max_turns={self.config.max_turns} exceeded without a final_answer"
+            )
+            raise AgentError(_max_turns_msg)  # noqa: TRY301 — intentional; on_error fires
+        except AgentCancel:
+            # User-initiated abort (raised from any hook). The user
+            # explicitly invoked the abort path, so ``on_error`` does
+            # NOT fire — this is the plan §5 contract. Just propagate.
+            raise
+        except Exception as exc:
+            # Any other escaping exception: fire ``on_error`` for
+            # observability (dead-letter / logging / circuit-breaker
+            # patterns) with ``ctx.error`` set to the escaping
+            # exception, then re-raise the ORIGINAL unchanged. ``on_error``
+            # cannot swallow — exceptions raised by ``on_error`` hooks
+            # themselves propagate to the caller alongside the original
+            # (the loop does not mask them).
+            #
+            # ``asyncio.CancelledError`` inherits from ``BaseException``
+            # in Python 3.8+, NOT from ``Exception``, so it bypasses
+            # this branch and propagates cleanly to the caller. That
+            # matches the contract: system-level cancellation is not an
+            # application error and does not fire ``on_error``.
+            await self._callbacks.dispatch_async(
+                "on_error",
+                Context(agent=self, error=exc, turn=turn),
+            )
+            raise
 
     async def _llm_step(
         self,

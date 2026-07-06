@@ -36,7 +36,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import tinyagent
-from tinyagent import AgentError
+from tinyagent import AgentCancel, AgentError
 
 
 # ============================================================================
@@ -505,3 +505,329 @@ async def test_non_final_tool_call_fires_before_and_after_hooks() -> None:
     assert result == "ok"
     assert "before" in fired, f"before_tool_execution should fire for non-final tool, got {fired!r}"
     assert "after" in fired, f"after_tool_execution should fire for non-final tool, got {fired!r}"
+
+
+# ============================================================================
+# 8. on_error integration + AgentCancel mid-loop (T12d)
+# ----------------------------------------------------------------------------
+# Per plan §0 C1 round-1 closure, §13 T12d, §5 (error propagation contract):
+#   - ``on_error`` fires on EVERY escaping exception EXCEPT ``AgentCancel``.
+#   - ``on_error`` is observational — it cannot swallow. The original exception
+#     is re-raised after ``on_error`` runs.
+#   - ``AgentCancel`` raised from any hook terminates the loop and propagates
+#     to the caller. ``on_error`` does NOT fire (user explicitly aborted).
+#   - Multiple ``on_error`` hooks run in registration order.
+# ============================================================================
+@pytest.mark.asyncio
+async def test_on_error_fires_when_before_llm_call_raises_generic_exception() -> None:
+    """A hook raising a generic Exception causes ``on_error`` to fire (with the exception in ctx).
+
+    The original exception is re-raised after ``on_error`` runs (not swallowed).
+    Plan §0 C1 round-1 fix + §13 T12d acceptance criterion.
+    """
+    agent = _make_agent()
+    boom = ValueError("synthetic hook failure")
+    agent._callbacks.register_before_llm_call(lambda ctx: (_ for _ in ()).throw(boom))
+    seen_errors: list[BaseException] = []
+    agent._callbacks.register_on_error(lambda ctx: seen_errors.append(ctx.error))
+
+    response = _func_response(tool_calls=[_final_answer_tool_call("never reached")])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(ValueError) as exc_info:
+            await agent.run_async("trigger before_llm_call failure")
+
+    assert exc_info.value is boom, (
+        f"the original exception must propagate unchanged; "
+        f"got {exc_info.value!r}, expected {boom!r}"
+    )
+    assert len(seen_errors) == 1, (
+        f"on_error should fire exactly once, got {len(seen_errors)}: {seen_errors!r}"
+    )
+    assert seen_errors[0] is boom, (
+        f"on_error ctx.error should be the original exception; "
+        f"got {seen_errors[0]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_on_error_fires_when_after_llm_call_raises_generic_exception() -> None:
+    """``on_error`` fires when ``after_llm_call`` raises a generic Exception."""
+    agent = _make_agent()
+    boom = RuntimeError("after_llm_call failed")
+    agent._callbacks.register_after_llm_call(lambda ctx: (_ for _ in ()).throw(boom))
+    seen_errors: list[BaseException] = []
+    agent._callbacks.register_on_error(lambda ctx: seen_errors.append(ctx.error))
+
+    response = _func_response(tool_calls=[_final_answer_tool_call("never reached")])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(RuntimeError) as exc_info:
+            await agent.run_async("trigger after_llm_call failure")
+
+    assert exc_info.value is boom
+    assert len(seen_errors) == 1
+    assert seen_errors[0] is boom
+
+
+@pytest.mark.asyncio
+async def test_on_error_fires_when_before_tool_execution_raises_generic_exception() -> None:
+    """``on_error`` fires when ``before_tool_execution`` raises a generic Exception."""
+    agent = _make_agent()
+
+    def my_tool(x: int = 1) -> str:
+        return f"v={x}"
+
+    agent._clients["my_tool"] = tinyagent._wrap_no_exception(my_tool)
+
+    boom = KeyError("before_tool_execution failed")
+    agent._callbacks.register_before_tool_execution(
+        lambda ctx: (_ for _ in ()).throw(boom)
+    )
+    seen_errors: list[BaseException] = []
+    agent._callbacks.register_on_error(lambda ctx: seen_errors.append(ctx.error))
+
+    response = _func_response(tool_calls=[_func_call("my_tool", call_id="c1", x=42)])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(KeyError) as exc_info:
+            await agent.run_async("trigger before_tool_execution failure")
+
+    assert exc_info.value is boom
+    assert len(seen_errors) == 1
+    assert seen_errors[0] is boom
+
+
+@pytest.mark.asyncio
+async def test_on_error_fires_when_after_tool_execution_raises_generic_exception() -> None:
+    """``on_error`` fires when ``after_tool_execution`` raises a generic Exception."""
+    agent = _make_agent()
+
+    def my_tool(x: int = 1) -> str:
+        return f"v={x}"
+
+    agent._clients["my_tool"] = tinyagent._wrap_no_exception(my_tool)
+
+    boom = TypeError("after_tool_execution failed")
+    agent._callbacks.register_after_tool_execution(
+        lambda ctx: (_ for _ in ()).throw(boom)
+    )
+    seen_errors: list[BaseException] = []
+    agent._callbacks.register_on_error(lambda ctx: seen_errors.append(ctx.error))
+
+    response = _func_response(tool_calls=[_func_call("my_tool", call_id="c1", x=42)])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(TypeError) as exc_info:
+            await agent.run_async("trigger after_tool_execution failure")
+
+    assert exc_info.value is boom
+    assert len(seen_errors) == 1
+    assert seen_errors[0] is boom
+
+
+@pytest.mark.asyncio
+async def test_on_error_does_not_swallow_exception_original_propagates() -> None:
+    """The original exception re-raises after ``on_error`` runs — observability only.
+
+    Plan §5 contract: "``on_error`` is observability-only." Even if ``on_error``
+    itself completes successfully, the original exception MUST propagate.
+    """
+    agent = _make_agent()
+    boom = ValueError("in-loop failure")
+    agent._callbacks.register_before_llm_call(lambda ctx: (_ for _ in ()).throw(boom))
+    on_error_ran = {"n": 0}
+    agent._callbacks.register_on_error(lambda ctx: on_error_ran.__setitem__("n", 1))
+
+    response = _func_response(tool_calls=[_final_answer_tool_call("never")])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(ValueError) as exc_info:
+            await agent.run_async("...")
+
+    assert exc_info.value is boom
+    assert on_error_ran["n"] == 1, (
+        f"on_error must run before the exception propagates; ran count={on_error_ran['n']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_terminates_loop_from_before_llm_call() -> None:
+    """``AgentCancel`` from ``before_llm_call`` terminates the loop and propagates."""
+    agent = _make_agent()
+    agent._callbacks.register_before_llm_call(
+        lambda ctx: (_ for _ in ()).throw(AgentCancel("aborted"))
+    )
+    on_error_calls: list[Any] = []
+    agent._callbacks.register_on_error(lambda ctx: on_error_calls.append(ctx))
+
+    response = _func_response(tool_calls=[_final_answer_tool_call("never reached")])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(AgentCancel):
+            await agent.run_async("abort before llm")
+
+    assert on_error_calls == [], (
+        f"on_error MUST NOT fire for AgentCancel (user-explicit abort); "
+        f"got {on_error_calls!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_terminates_loop_from_after_llm_call() -> None:
+    """``AgentCancel`` from ``after_llm_call`` terminates the loop and propagates."""
+    agent = _make_agent()
+    agent._callbacks.register_after_llm_call(
+        lambda ctx: (_ for _ in ()).throw(AgentCancel("aborted"))
+    )
+    on_error_calls: list[Any] = []
+    agent._callbacks.register_on_error(lambda ctx: on_error_calls.append(ctx))
+
+    response = _func_response(tool_calls=[_final_answer_tool_call("never reached")])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(AgentCancel):
+            await agent.run_async("abort after llm")
+
+    assert on_error_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_terminates_loop_from_before_tool_execution() -> None:
+    """``AgentCancel`` from ``before_tool_execution`` terminates the loop and propagates."""
+    agent = _make_agent()
+
+    def my_tool(x: int = 1) -> str:
+        return f"v={x}"
+
+    agent._clients["my_tool"] = tinyagent._wrap_no_exception(my_tool)
+
+    agent._callbacks.register_before_tool_execution(
+        lambda ctx: (_ for _ in ()).throw(AgentCancel("aborted"))
+    )
+    on_error_calls: list[Any] = []
+    agent._callbacks.register_on_error(lambda ctx: on_error_calls.append(ctx))
+
+    response = _func_response(tool_calls=[_func_call("my_tool", call_id="c1", x=42)])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(AgentCancel):
+            await agent.run_async("abort before tool")
+
+    assert on_error_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_terminates_loop_from_after_tool_execution() -> None:
+    """``AgentCancel`` from ``after_tool_execution`` terminates the loop and propagates."""
+    agent = _make_agent()
+
+    def my_tool(x: int = 1) -> str:
+        return f"v={x}"
+
+    agent._clients["my_tool"] = tinyagent._wrap_no_exception(my_tool)
+
+    agent._callbacks.register_after_tool_execution(
+        lambda ctx: (_ for _ in ()).throw(AgentCancel("aborted"))
+    )
+    on_error_calls: list[Any] = []
+    agent._callbacks.register_on_error(lambda ctx: on_error_calls.append(ctx))
+
+    response = _func_response(tool_calls=[_func_call("my_tool", call_id="c1", x=42)])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(AgentCancel):
+            await agent.run_async("abort after tool")
+
+    assert on_error_calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_from_before_tool_execution_during_final_answer() -> None:
+    """``AgentCancel`` from ``before_tool_execution`` on ``final_answer`` terminates the loop."""
+    agent = _make_agent()
+    agent._callbacks.register_before_tool_execution(
+        lambda ctx: (_ for _ in ()).throw(AgentCancel("aborted during final_answer"))
+    )
+    on_error_calls: list[Any] = []
+    agent._callbacks.register_on_error(lambda ctx: on_error_calls.append(ctx))
+
+    response = _func_response(tool_calls=[_final_answer_tool_call("the-answer")])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(AgentCancel):
+            await agent.run_async("abort during final_answer")
+
+    assert on_error_calls == []
+
+
+@pytest.mark.asyncio
+async def test_multiple_on_error_hooks_run_in_registration_order() -> None:
+    """Multiple ``on_error`` hooks run in registration order (append-list semantics).
+
+    Mirrors the contract for all other hook lists (round-3 M3 dict-backed
+    `self._hooks[name]` with append semantics). On-error dispatch iterates
+    `self._hooks["on_error"]` in order.
+    """
+    agent = _make_agent()
+    boom = ValueError("boom")
+    agent._callbacks.register_before_llm_call(lambda ctx: (_ for _ in ()).throw(boom))
+    order: list[str] = []
+    agent._callbacks.register_on_error(lambda ctx: order.append("first"))
+    agent._callbacks.register_on_error(lambda ctx: order.append("second"))
+    agent._callbacks.register_on_error(lambda ctx: order.append("third"))
+
+    response = _func_response(tool_calls=[_final_answer_tool_call("never")])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(ValueError):
+            await agent.run_async("trigger on_error chain")
+
+    assert order == ["first", "second", "third"], (
+        f"on_error hooks must run in registration order, got {order!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_on_error_hook_runs() -> None:
+    """An async ``on_error`` hook is awaited (not silently dropped).
+
+    Sanity check that the dispatch_async path used by the loop also
+    handles coroutine-returning hooks (round-3 M3 closure contract).
+    """
+    agent = _make_agent()
+    boom = ValueError("boom")
+    agent._callbacks.register_before_llm_call(lambda ctx: (_ for _ in ()).throw(boom))
+
+    completed = {"n": 0}
+
+    async def async_on_error(ctx: Any) -> None:
+        # Yield to prove the coroutine was awaited.
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(0)
+        completed["n"] += 1
+
+    agent._callbacks.register_on_error(async_on_error)
+
+    response = _func_response(tool_calls=[_final_answer_tool_call("never")])
+
+    with patch.object(tinyagent.TinyAgent, "call_model", new_callable=AsyncMock) as mock_cm:
+        mock_cm.return_value = response
+        with pytest.raises(ValueError):
+            await agent.run_async("...")
+
+    assert completed["n"] == 1, (
+        f"async on_error hook must be awaited; ran count={completed['n']}"
+    )
