@@ -119,7 +119,17 @@ __version__: str = "0.1.0"
 DEFAULT_MAX_TURNS: int = 10
 DEFAULT_KEEP_LAST_N: int = 10
 DEFAULT_REQUEST_TIMEOUT_S: float = 120.0
-SPAN_LIMITS: dict[str, int] = {}  # populated in T9
+# T9: span attribute size caps. Tool args/results are JSON-serialised and
+# clipped against these limits so a 1 MB tool payload cannot blow up the
+# span budget. Tuned in T9; safe defaults chosen for both human-readable
+# traces and OTLP exporter budgets.
+SPAN_LIMITS: dict[str, int] = {
+    "tool_args": 4096,
+    "tool_result": 4096,
+    "input_messages": 8192,
+    "output": 4096,
+}
+_SPAN_TRUNCATION_MARKER: str = "...[truncated]"
 
 # LOCAL_PROVIDERS: providers whose cost is never recorded on the span (M6 round-2).
 # T2 spec: must include ollama, vllm, and local — these are self-hosted providers
@@ -916,6 +926,248 @@ def _setup_tracing_cache_clear() -> None:
     observe a fresh ``trace.get_tracer`` call.
     """
     _tracer_cache.clear()
+
+
+# ---------------------------------------------------------------------
+# Section 13a - Pricing lookup (T9 STUB — replaced by T2)
+# ---------------------------------------------------------------------
+# Canonical signature: (model_id, prompt_tokens, completion_tokens,
+# pricing=None, pricing_fn=None) -> float | None. The T9 stub honours the
+# optional override channels so tests can drive the cost attribute; T2
+# replaces this body with the longest-prefix match algorithm against
+# DEFAULT_PRICING + LOCAL_PROVIDERS short-circuit. The contract
+# (`float | None`) and the omit-when-None invariant (plan §0 C2 +
+# cross-cutting risk #8) are LOCKED here so the T9 span writer is correct
+# against the canonical rule.
+def _estimate_cost(
+    model_id: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    pricing: dict[str, tuple[float, float]] | None = None,
+    pricing_fn: Callable[[str], tuple[float, float] | None] | None = None,
+) -> float | None:
+    """Estimate USD cost for a single LLM call (CANONICAL — plan §7).
+
+    Returns a float (USD total) when the price is known, else ``None``.
+    ``None`` means "unknown price" — the caller (the span writer in
+    ``_SpanGeneration.call_llm``) MUST omit the ``gen_ai.usage.cost``
+    attribute when this returns ``None`` (plan §0 C2, cross-cutting risk
+    #8). There is **no** ``(0.0, 0.0)`` fallback: zero is a valid *known*
+    cost (free / included-credit models); only ``None`` triggers the
+    omit.
+
+    Parameters
+    ----------
+    model_id:
+        Provider-prefixed model string, e.g. ``"openai:gpt-4o-mini"``.
+    prompt_tokens:
+        Input tokens consumed by this call.
+    completion_tokens:
+        Output tokens emitted by this call.
+    pricing:
+        Optional full-table override (provider:model -> per-1M tuple).
+        Wins over ``DEFAULT_PRICING`` when provided.
+    pricing_fn:
+        Optional per-call callable returning ``(input_per_1m,
+        output_per_1m)`` or ``None``. Highest precedence.
+
+    Returns
+    -------
+    USD total cost as float, or ``None`` if the price is unknown.
+    """
+    if pricing_fn is not None:
+        price = pricing_fn(model_id)
+        if price is None:
+            return None
+        return _cost_from_price(prompt_tokens, completion_tokens, price)
+    table = pricing if pricing is not None else DEFAULT_PRICING
+    provider, _, _ = model_id.partition(":")
+    if provider in LOCAL_PROVIDERS:
+        return None
+    # Longest-prefix match (plan §7): pick the most specific table key
+    # that ``model_id`` starts with. No match → unknown → None.
+    candidates = sorted(
+        (k for k in table if model_id.startswith(k)),
+        key=len,
+        reverse=True,
+    )
+    if not candidates:
+        return None
+    return _cost_from_price(prompt_tokens, completion_tokens, table[candidates[0]])
+
+
+def _cost_from_price(
+    prompt_tokens: int,
+    completion_tokens: int,
+    price: tuple[float, float],
+) -> float:
+    """Convert per-1M-token pricing + token counts to a USD total.
+
+    ``price`` is ``(input_usd_per_1m, output_usd_per_1m)``. Always
+    returns a finite float; callers decide whether to write it as a
+    span attribute (see ``_compute_cost_attribute``).
+    """
+    in_per_m, out_per_m = price
+    return (prompt_tokens / 1_000_000.0) * in_per_m + (
+        completion_tokens / 1_000_000.0
+    ) * out_per_m
+
+
+def _compute_cost_attribute(
+    model_id: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> float | None:
+    """Return the cost-attribute value for a span, or ``None`` when price is unknown.
+
+    Thin pass-through over ``_estimate_cost`` — exists so the span writer
+    (``_SpanGeneration.call_llm``) and the test suite have a single,
+    stable seam. Per plan §0 C2 + cross-cutting risk #8: callers MUST
+    omit ``gen_ai.usage.cost`` from the span when this returns
+    ``None``. Returning ``0.0`` is forbidden (it would make "unknown"
+    indistinguishable from "actually free" in downstream dashboards).
+    """
+    return _estimate_cost(model_id, prompt_tokens, completion_tokens)
+
+
+# ---------------------------------------------------------------------
+# Section 13b - Span generation (T9)
+# ---------------------------------------------------------------------
+class _SpanGeneration:
+    """OpenTelemetry span generator for LLM and tool calls (plan §2 section 13).
+
+    Opens ``call_llm`` and ``execute_tool`` child spans under a parent
+    ``invoke_agent`` span (the parent is created by the agent loop, not
+    here). For each child span, the standard semconv attributes
+    (``gen_ai.operation.name``, ``gen_ai.usage.input_tokens``,
+    ``gen_ai.usage.output_tokens``) plus the custom
+    ``gen_ai.usage.cost`` attribute are populated up-front when the
+    response is known.
+
+    The ``gen_ai.usage.cost`` attribute is **omitted** when the model's
+    price is unknown (plan §0 C2 + cross-cutting risk #8); the writer
+    never emits a ``0.0`` placeholder, because that would make "unknown"
+    indistinguishable from "actually free" in observability tooling.
+    """
+
+    def __init__(self, tracer: Any, model_id: str) -> None:
+        """Store the tracer and the model id used in ``gen_ai.request.model``.
+
+        Parameters
+        ----------
+        tracer:
+            An OTel ``Tracer`` (typically obtained via
+            ``_setup_tracing(name)``).
+        model_id:
+            Provider-prefixed model string, e.g. ``"openai:gpt-4o-mini"``.
+            Stored on the instance so every span it opens carries
+            ``gen_ai.request.model``.
+        """
+        self._tracer = tracer
+        self._model_id = model_id
+
+    def call_llm(self, response: Any) -> Any:
+        """Open a ``call_llm`` span with token + cost attrs from ``response``.
+
+        ``response`` is an any-llm ``ChatCompletion`` (or any object with
+        ``.usage.prompt_tokens`` / ``.usage.completion_tokens``). The
+        span attributes are populated from ``response.usage``:
+
+        - ``gen_ai.usage.input_tokens``  -> ``response.usage.prompt_tokens``
+        - ``gen_ai.usage.output_tokens`` -> ``response.usage.completion_tokens``
+        - ``gen_ai.usage.cost`` -> ``_compute_cost_attribute(...)``
+          **only when non-None**.
+
+        When ``response`` has no ``usage`` attribute, the token and
+        cost attributes are simply absent (no zero-defaulting).
+
+        Returns the OTel context-manager produced by
+        ``tracer.start_as_current_span("call_llm", attributes=...)``.
+        Use as ``with span_gen.call_llm(response): ...``.
+        """
+        attrs: dict[str, Any] = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": self._model_id,
+        }
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
+            out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+            attrs["gen_ai.usage.input_tokens"] = in_tok
+            attrs["gen_ai.usage.output_tokens"] = out_tok
+            cost = _compute_cost_attribute(self._model_id, in_tok, out_tok)
+            if cost is not None:
+                attrs["gen_ai.usage.cost"] = cost
+        return self._tracer.start_as_current_span("call_llm", attributes=attrs)
+
+    def execute_tool(
+        self,
+        *,
+        tool_name: str,
+        args: Any,
+        result: Any,
+    ) -> Any:
+        """Open an ``execute_tool`` span with tool name / args / result attrs.
+
+        ``args`` and ``result`` are stringified (JSON when dict/list) and
+        truncated per ``SPAN_LIMITS["tool_args"]`` /
+        ``SPAN_LIMITS["tool_result"]`` so that a model returning a 1 MB
+        tool payload cannot blow up the span budget.
+
+        Returns the OTel context-manager produced by
+        ``tracer.start_as_current_span("execute_tool", attributes=...)``.
+        """
+        args_limit = SPAN_LIMITS.get("tool_args", 4096)
+        result_limit = SPAN_LIMITS.get("tool_result", 4096)
+        attrs: dict[str, Any] = {
+            "gen_ai.operation.name": "execute_tool",
+            "gen_ai.tool.name": tool_name,
+            "gen_ai.tool.args": _truncate_for_span(
+                _stringify_for_span(args), args_limit
+            ),
+            "gen_ai.tool.result": _truncate_for_span(
+                _stringify_for_span(result), result_limit
+            ),
+        }
+        return self._tracer.start_as_current_span(
+            "execute_tool", attributes=attrs
+        )
+
+
+# ---------------------------------------------------------------------
+# Section 13c - Internal string helpers for span attributes
+# ---------------------------------------------------------------------
+def _stringify_for_span(value: Any) -> str:
+    """Coerce a Python value into a span-attribute-friendly string.
+
+    Dicts / lists / tuples are JSON-serialised; everything else is
+    stringified via ``str(...)``. ``None`` becomes the empty string.
+    Used for ``gen_ai.tool.args`` and ``gen_ai.tool.result`` attrs.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            return json.dumps(value, default=str)
+        except (TypeError, ValueError):
+            return str(value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _truncate_for_span(text: str, limit: int) -> str:
+    """Truncate ``text`` to ``limit`` chars, appending a marker when clipped.
+
+    A span attribute is a finite string; arbitrary-length tool args /
+    results must be clipped to keep the trace export under control. The
+    marker is appended *inside* the budget so the result still satisfies
+    ``len <= limit``.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    keep = max(0, limit - len(_SPAN_TRUNCATION_MARKER))
+    return text[:keep] + _SPAN_TRUNCATION_MARKER
 
 
 # =====================================================================
