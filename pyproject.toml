@@ -95,4 +95,3 @@ addopts = ["-ra", "--strict-config", "--strict-markers"]
 # flat-layout repo-root module (no src/, no `pip install -e .` required for
 # the test suite). Matches plan §3 flat-module layout.
 pythonpath = ["."]
-]

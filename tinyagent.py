@@ -26,7 +26,6 @@ guardrails.
 License: Apache-2.0 (see LICENSE; NOTICE preserves upstream Mozilla.ai attribution).
 """
 
-
 # =====================================================================
 # Section 2 - Imports
 # =====================================================================
@@ -45,6 +44,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Coroutine,
     TypedDict,
 )
 
@@ -175,13 +175,147 @@ class MCPProtocolError(AgentError):
 
 
 # =====================================================================
-# Section 7 - Callback Registry
+# Section 7 - Callback Registry (CANONICAL — round-3 M2 + M3 storage model)
 # =====================================================================
 class CallbackRegistry:
     """Registry of hook callables for the canonical 5-hook set.
 
-    Stub for T1; full implementation lands in T6 (round-3 M3 storage model).
+    Storage is dict-backed: `self._hooks: dict[str, list[Callable]]` keyed by
+    hook name. Users register hooks via `register_*` methods; dispatch reads
+    via `self._hooks.get(name, ())`. The attribute-style form
+    `cb.before_llm_call.append(fn)` is **not** supported and raises
+    AttributeError — see §0 C5 (round-3 M3 closure) for rationale.
+
+    Hook signature (CANONICAL — round-3 M2): one positional `ctx` argument;
+    return value discarded. Both sync (`(ctx) -> None`) and async
+    (`(ctx) -> Awaitable[None]`) hooks are supported. Async hooks are
+    awaited via the pinned event loop (set by `run()`) using
+    `asyncio.run_coroutine_threadsafe`; this is the only correct path for
+    sync `run()` (peer-review M3 round-1 closure).
     """
+
+    __slots__ = ("_hooks", "_loop")
+
+    # Canonical hook names — frozen for the lifetime of the class.
+    _HOOK_NAMES: tuple[str, ...] = (
+        "before_llm_call",
+        "after_llm_call",
+        "before_tool_execution",
+        "after_tool_execution",
+        "on_error",
+    )
+
+    def __init__(self) -> None:
+        """Initialise with empty per-hook lists and no pinned loop."""
+        self._hooks: dict[str, list[Callable[..., Any]]] = {n: [] for n in self._HOOK_NAMES}
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    # ------------------------------------------------------------------
+    # Registration — five `register_*` methods (one per canonical hook)
+    # ------------------------------------------------------------------
+    def register_before_llm_call(self, fn: Callable[[object], Any]) -> None:
+        """Append `fn` to the `before_llm_call` hook list."""
+        self._hooks["before_llm_call"].append(fn)
+
+    def register_after_llm_call(self, fn: Callable[[object], Any]) -> None:
+        """Append `fn` to the `after_llm_call` hook list."""
+        self._hooks["after_llm_call"].append(fn)
+
+    def register_before_tool_execution(self, fn: Callable[[object], Any]) -> None:
+        """Append `fn` to the `before_tool_execution` hook list."""
+        self._hooks["before_tool_execution"].append(fn)
+
+    def register_after_tool_execution(self, fn: Callable[[object], Any]) -> None:
+        """Append `fn` to the `after_tool_execution` hook list."""
+        self._hooks["after_tool_execution"].append(fn)
+
+    def register_on_error(self, fn: Callable[[object], Any]) -> None:
+        """Append `fn` to the `on_error` hook list."""
+        self._hooks["on_error"].append(fn)
+
+    # ------------------------------------------------------------------
+    # Dispatch — sync entry points
+    # ------------------------------------------------------------------
+    def dispatch(self, name: str, ctx: object) -> None:
+        """Dispatch a hook event. Supports sync and async hooks.
+
+        Iterates `self._hooks.get(name, ())` and invokes each hook with
+        `ctx`. For hooks that return a coroutine, the coroutine is
+        awaited:
+
+        - If a loop is pinned (`self._loop` is not None), the coroutine is
+          scheduled via `asyncio.run_coroutine_threadsafe` against the
+          pinned loop and the dispatch blocks on the resulting future.
+          This is the canonical sync path used by `agent.run()`.
+        - If no loop is pinned, the coroutine is awaited via `asyncio.run`
+          (top-level / out-of-loop path). The implementation never
+          silently drops a coroutine — that was the round-1 bug C7
+          flagged and the contract here closes it.
+
+        Hook return values are DISCARDED. The hook contract is
+        fire-and-forget: `Callable[[Context], None] | Callable[[Context],
+        Awaitable[None]]` (round-3 M2).
+        """
+        for hook in self._hooks.get(name, ()):
+            result = hook(ctx)
+            if asyncio.iscoroutine(result):
+                if self._loop is not None:
+                    # Pinned-loop bridge — required for sync `run()`.
+                    future = asyncio.run_coroutine_threadsafe(self._await_coro(result), self._loop)
+                    future.result()
+                else:
+                    # No pinned loop; spin a one-shot loop to await the
+                    # coroutine. This is the entry point for tests and
+                    # one-off sync callers outside the agent runtime.
+                    asyncio.run(self._await_coro(result))
+
+    def dispatch_sync(self, name: str, ctx: object) -> None:
+        """Bridge async hooks to a sync context via the pinned event loop.
+
+        Asserts `self._loop` is set; the assertion exists to prevent the
+        silent-coroutine-drop bug from peer-review M3 round-1. The caller
+        MUST have pinned the loop (via `self._loop = asyncio.get_event_loop()`
+        inside the coroutine that `run_async_in_sync` runs) before calling
+        `dispatch_sync`. If the hook is async, it is scheduled on the
+        pinned loop via `asyncio.run_coroutine_threadsafe` and this
+        method blocks on the resulting future.
+        """
+        assert self._loop is not None, (
+            "CallbackRegistry.dispatch_sync called before run() pinned the loop. "
+            "This is a bug; please open an issue."
+        )
+        for hook in self._hooks.get(name, ()):
+            result = hook(ctx)
+            if asyncio.iscoroutine(result):
+                future = asyncio.run_coroutine_threadsafe(self._await_coro(result), self._loop)
+                future.result()
+
+    # ------------------------------------------------------------------
+    # Internal — single coroutine-await helper used by run_coroutine_threadsafe
+    # ------------------------------------------------------------------
+    async def _await_coro(self, coro: Coroutine[Any, Any, object]) -> object:
+        """Pass-through awaitable wrapping a coroutine for the pinned loop.
+
+        Per plan §2 section 7: `run_coroutine_threadsafe` needs an awaitable
+        bound to the target loop. The method body is a single `await`, but
+        routing through this helper gives a self-documenting call site
+        AND a single place to add error wrapping later if needed (e.g.,
+        catching CancelledError to release loop resources on shutdown).
+        """
+        return await coro
+
+    # ------------------------------------------------------------------
+    # Test helper
+    # ------------------------------------------------------------------
+    def clear(self) -> None:
+        """Empty every per-hook list in `self._hooks` (keeps the keys).
+
+        Test-only convenience. Production code never calls this — tests
+        use it to reset the registry between scenarios without rebuilding
+        the registry object (which would lose any loop pinning).
+        """
+        for name in self._HOOK_NAMES:
+            self._hooks[name].clear()
 
 
 # =====================================================================
@@ -330,8 +464,10 @@ if not logger.handlers:
 # mcp.types.Tool is referenced under TYPE_CHECKING above for type checkers).
 try:
     from mcp.types import Tool as _ImportedMCPTool  # type: ignore[attr-defined]
+
     MCPTool: Any = _ImportedMCPTool
 except ImportError:  # pragma: no cover - guard for future mcp API drift
+
     class MCPTool:  # type: ignore[no-redef,misc]
         """Fallback when mcp.types.Tool cannot be imported at runtime.
 
