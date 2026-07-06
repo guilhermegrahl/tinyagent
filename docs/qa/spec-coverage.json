@@ -1,0 +1,123 @@
+{
+  "decision": "PASS",
+  "summary": "All 10 locked decisions and 9 success criteria from clarified-requirements.md are satisfied. The single-file runtime lives at /Users/guilhermegrahl/tinyagent/tinyagent.py (~2700 LOC) with flat layout (no src/), Apache-2.0 LICENSE + NOTICE, and a flat py-modules pyproject.toml. The five canonical callbacks (before_llm_call/after_llm_call/before_tool_execution/after_tool_execution/on_error) are wired via register_* methods and exercised by tests in tests/test_callback_registry.py and tests/test_agent_loop.py. OTel follows the library pattern with a custom gen_ai.usage.cost attribute, MCP is stdio-only via MCPServer, final_answer is auto-attached and short-circuits via break. Example tools (calculate/http_get/final_answer) are shipped and tested. Integration suite is gated by ANY_LLM_TEST_MODEL using per-scenario skipif markers (PROVIDER_ENV_SKIPIF / ANY_LLM_MODEL_SKIPIF) with PROVIDER_KEY_ENV.get() for ollama/vertex safety. No unittest.TestCase classes, no @patch('dotted.string.path') mocks, no src/ directory. README documents install + callbacks + MCP + OTel wiring.",
+  "decisions_audit": [
+    {
+      "id": "D1",
+      "label": "Fork and re-package mozilla-ai/tinyagent under our own Apache-2.0 name",
+      "status": "covered",
+      "evidence": "tinyagent.py:1-26 (SPDX header + Apache-2.0 docstring); NOTICE:1-47 (upstream attribution); pyproject.toml:8 (description explicitly states fork)"
+    },
+    {
+      "id": "D2",
+      "label": "Single-file install: literally one Python file (tinyagent.py) at the core, pip installable",
+      "status": "covered",
+      "evidence": "tinyagent.py (2704 LOC single runtime file at repo root); pyproject.toml:58-59 ([tool.setuptools] py-modules = [\"tinyagent\"]); no src/ directory exists in repo"
+    },
+    {
+      "id": "D3",
+      "label": "MCP transports: stdio only",
+      "status": "covered",
+      "evidence": "tinyagent.py:967-1245 (MCPServer class uses mcp.client.stdio.stdio_client only); README.md:147-151 ('Only the stdio transport is supported'); tests/test_mcp_stdio.py:1-47"
+    },
+    {
+      "id": "D4",
+      "label": "OTel export: pluggable via standard OTel SDK env vars (OTEL_EXPORTER_OTLP_ENDPOINT)",
+      "status": "covered",
+      "evidence": "tinyagent.py:1453-1486 (_setup_tracing does NOT set_tracer_provider or wire exporters — library pattern); README.md:155-177 (host app installs TracerProvider via OTEL_* env vars); examples/tracing_otlp.py (wires OTLP exporter)"
+    },
+    {
+      "id": "D5",
+      "label": "Canonical 5-hook callback set: before_llm_call, after_llm_call, before_tool_execution, after_tool_execution, on_error",
+      "status": "covered",
+      "evidence": "tinyagent.py:285-291 (_HOOK_NAMES tuple); tinyagent.py:301-319 (five register_* methods); README.md:62-117; tests/test_callback_registry.py:149-180 (one test per register_* method verifying dict-backed storage)"
+    },
+    {
+      "id": "D6",
+      "label": "A2A serving: skipped (out of scope)",
+      "status": "covered",
+      "evidence": "tinyagent.py has no a2a imports/exports; __all__:88-119 contains no a2a symbols; no a2a/ directory exists"
+    },
+    {
+      "id": "D7",
+      "label": "any-llm provider coverage: fully open, no opinion; tests cover a reference trio",
+      "status": "covered",
+      "evidence": "tinyagent.py:76 (import any_llm); tinyagent.py:2057 (AnyLLM.create(provider, api_key=api_key)); tinyagent.py:150-163 (PROVIDER_KEY_ENV + PROVIDER_EXTRA_ENV tables cover openai/anthropic/mistral/groq/azure/huggingface/gemini + vertex extras); tests/integration/test_e2e_anyllm.py:42 (gated on ANY_LLM_TEST_MODEL)"
+    },
+    {
+      "id": "D8",
+      "label": "Repo state: /Users/guilhermegrahl/tinyagent is the target, build in place",
+      "status": "covered",
+      "evidence": "All implementation files at /Users/guilhermegrahl/tinyagent/; pyproject.toml project.name = 'tinyagent'"
+    },
+    {
+      "id": "D9",
+      "label": "Testing strategy: unit + integration gated by ANY_LLM_TEST_MODEL (skip when unset)",
+      "status": "covered",
+      "evidence": "tests/integration/conftest.py:33-76 (PROVIDER_ENV_SKIPIF + ANY_LLM_MODEL_SKIPIF markers via PROVIDER_KEY_ENV.get(provider, ...)); tests/integration/test_e2e_anyllm.py:42, 98, 128, 159, 341 (six scenarios with per-scenario skipif)"
+    },
+    {
+      "id": "D10",
+      "label": "Example tools to ship: calculate, http_get, final_answer",
+      "status": "covered",
+      "evidence": "tinyagent.py:772-953 (final_answer bare function, calculate via simpleeval, async http_get via httpx); __all__:111-113; tests/test_example_tools.py:24, 36-46 (importability + behavior tests); README.md:33-46 (Quickstart uses calculate + final_answer)"
+    }
+  ],
+  "success_criteria_audit": [
+    {
+      "id": "SC1",
+      "label": "Single-command install: pip install tinyagent succeeds on Python 3.11, 3.12, 3.13",
+      "status": "covered",
+      "evidence": "pyproject.toml:10 (requires-python = \">=3.11\"); pyproject.toml:27-30 (classifiers for 3.11/3.12/3.13); tests/test_examples_run.py:58 (test_pip_install_smoke runs pip install -e . in fresh venv)"
+    },
+    {
+      "id": "SC2",
+      "label": "ReAct loop works end-to-end with stdio MCP server + custom tools via final_answer",
+      "status": "covered",
+      "evidence": "tinyagent.py:2302-2437 (run_async ReAct loop); examples/calculator_mcp_stdio.py:80-106 (multi-turn task via MCP tools + final_answer); tests/integration/test_e2e_anyllm.py:100-122 (test_calculator_then_final_answer); tests/test_agent_loop.py:179-189 (test_final_answer_returns_answer_string)"
+    },
+    {
+      "id": "SC3",
+      "label": "Tracing is real: invoke_agent span + call_llm (input/output tokens, cost when known) + execute_tool (name, args, result)",
+      "status": "covered",
+      "evidence": "tinyagent.py:1658-1778 (_SpanGeneration writes call_llm with input_tokens/output_tokens/cost attrs + execute_tool with name/args/result); tinyagent.py:1737-1744 (cost written iff non-None); tests/test_otel.py:35-42 (asserts INPUT_TOK_ATTR, OUTPUT_TOK_ATTR, COST_ATTR, TOOL_NAME_ATTR, TOOL_ARGS_ATTR, TOOL_RESULT_ATTR)"
+    },
+    {
+      "id": "SC4",
+      "label": "Callbacks as guardrails: register before_tool_execution that raises halts loop without losing trace context",
+      "status": "covered",
+      "evidence": "tinyagent.py:2414-2437 (AgentCancel propagates unchanged, on_error fires for other exceptions); tests/test_agent_loop.py:576-630 (test_on_error_fires_when_before_tool_execution_raises_generic_exception — hook raises KeyError, on_error fires, exception propagates)"
+    },
+    {
+      "id": "SC5",
+      "label": "final_answer: model calling final_answer exits loop and returns typed answer",
+      "status": "covered",
+      "evidence": "tinyagent.py:2484-2489 (first final_answer short-circuits via break returning str); tests/test_agent_loop.py:179-188 (asserts result == \"hello\" string when LLM emits final_answer)"
+    },
+    {
+      "id": "SC6",
+      "label": "Multi-provider: switching providers requires only one-line config change (model string)",
+      "status": "covered",
+      "evidence": "tinyagent.py:2052-2057 (provider from config.model.partition(\":\")); README.md:197-212 (one-line config change examples for OpenAI/Anthropic/Groq/Ollama); tests/integration/test_e2e_anyllm.py:69-92 (any-llm model string drives provider)"
+    },
+    {
+      "id": "SC7",
+      "label": "License + version: LICENSE contains Apache 2.0; pyproject declares license; version is 0.1.0",
+      "status": "covered",
+      "evidence": "LICENSE:1-200 (full Apache 2.0 verbatim); pyproject.toml:7 (version = \"0.1.0\"); pyproject.toml:11 (license = { text = \"Apache-2.0\" }); pyproject.toml:26 (License :: OSI Approved classifier)"
+    },
+    {
+      "id": "SC8",
+      "label": "README + runnable example: install, config, tool reg, MCP stdio, tracing, callbacks, e2e using calculate+http_get+final_answer",
+      "status": "covered",
+      "evidence": "README.md:1-236 (covers Install, Quickstart, Callbacks, MCP stdio tools, Tracing, Multi-provider, Examples sections); README.md:33-46 (Quickstart uses calculate+final_answer); README.md:200-205 (multi-provider examples); README.md:217-223 (links to http_demo.py, calculator_mcp_stdio.py, tracing_otlp.py)"
+    },
+    {
+      "id": "SC9",
+      "label": "Single-file runtime: package's importable source is a single Python file",
+      "status": "covered",
+      "evidence": "tinyagent.py (2704 LOC single file at repo root); pyproject.toml:58-59 ([tool.setuptools] py-modules = [\"tinyagent\"]); tests/test_imports.py:46-65 (test_import_top_level + test_all_symbols_importable); no src/ directory exists"
+    }
+  ],
+  "gaps": []
+}

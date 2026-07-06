@@ -1,0 +1,79 @@
+{
+  "decision": "FAIL",
+  "summary": "274 tests collected: 257 passed, 11 failed, 6 skipped. All 11 failures are concentrated in tests/test_example_tools.py and stem from missing top-level imports of `simpleeval` and `httpx` inside tinyagent.py — both modules are declared as runtime dependencies in pyproject.toml, so this is an actual source bug (the example tools reference names that are never bound), not a dependency issue.",
+  "test_command": "python3 -m pytest tests/ -v --tb=short",
+  "total": 274,
+  "passed": 257,
+  "failed": 11,
+  "skipped": 6,
+  "errors": 0,
+  "failures": [
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_calculate_basic_arithmetic",
+      "summary": "NameError: name 'simpleeval' is not defined (raised at tinyagent.py:820 in _eval_arithmetic when constructing simpleeval.SimpleEval(), and again at tinyagent.py:884 when referencing simpleeval.FunctionNotDefined)",
+      "root_cause": "actual bug: tinyagent.py uses `simpleeval` in module-scope helper code but never imports the module at runtime (dependency is declared in pyproject.toml but not imported)"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_calculate_parentheses_and_floats",
+      "summary": "NameError: name 'simpleeval' is not defined at tinyagent.py:820",
+      "root_cause": "actual bug: same missing `import simpleeval` in tinyagent.py"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_calculate_math_constants",
+      "summary": "NameError: name 'simpleeval' is not defined at tinyagent.py:820",
+      "root_cause": "actual bug: same missing `import simpleeval` in tinyagent.py"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_calculate_division_by_zero_returns_error_string",
+      "summary": "NameError: name 'simpleeval' is not defined at tinyagent.py:820",
+      "root_cause": "actual bug: same missing `import simpleeval` in tinyagent.py"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_calculate_blocks_dunder_import",
+      "summary": "NameError: name 'simpleeval' is not defined at tinyagent.py:820",
+      "root_cause": "actual bug: same missing `import simpleeval` in tinyagent.py"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_calculate_blocks_attribute_access",
+      "summary": "NameError: name 'simpleeval' is not defined at tinyagent.py:820",
+      "root_cause": "actual bug: same missing `import simpleeval` in tinyagent.py"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_calculate_syntax_error_returns_error_string",
+      "summary": "NameError: name 'simpleeval' is not defined at tinyagent.py:820",
+      "root_cause": "actual bug: same missing `import simpleeval` in tinyagent.py"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_calculate_empty_string_returns_error_string",
+      "summary": "NameError: name 'simpleeval' is not defined at tinyagent.py:820",
+      "root_cause": "actual bug: same missing `import simpleeval` in tinyagent.py"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_http_get_returns_response_text",
+      "summary": "NameError: name 'httpx' is not defined at tinyagent.py:938 (inside http_get coroutine, referencing httpx.AsyncClient / httpx.HTTPError)",
+      "root_cause": "actual bug: tinyagent.py uses `httpx` in http_get but never imports the module (declared in pyproject.toml but not imported at runtime)"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_http_get_truncates_oversized_response",
+      "summary": "NameError: name 'httpx' is not defined at tinyagent.py:938",
+      "root_cause": "actual bug: same missing `import httpx` in tinyagent.py"
+    },
+    {
+      "file": "tests/test_example_tools.py",
+      "test": "test_http_get_returns_error_string_on_failure",
+      "summary": "NameError: name 'httpx' is not defined at tinyagent.py:938",
+      "root_cause": "actual bug: same missing `import httpx` in tinyagent.py"
+    }
+  ],
+  "pass_rate": 0.958955
+}

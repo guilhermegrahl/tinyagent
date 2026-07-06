@@ -1,0 +1,337 @@
+{
+  "decision": "WARN",
+  "summary": "Syntax check and module imports pass cleanly. mypy strict mode produces 3 minor `unused-ignore` warnings (no blockers). ruff reports 454 findings across the tree — the vast majority (SLF001 x180, ANN401 x102, PLR2004 x50, INP001 x23) are stylistic noise driven by an intentionally strict `extend-select = [\"ALL\"]` config in pyproject.toml, and against tests/ that only excludes S101/D/ARG. Source-level findings: 88 ruff + 3 mypy, all minor, no real defects. Anti-pattern checks (getattr/hasattr/string-patch/bare-type-ignore/unittest.TestCase) pass with only legitimate interface-introspection uses in tests.",
+  "tools_run": ["ruff 0.15.20", "mypy 2.1.0", "py_compile (3.14)", "anti-pattern grep (hasattr/getattr, @patch string form, bare type:ignore, pip install, unittest.TestCase)"],
+  "tools_skipped": [],
+  "findings": [
+    {
+      "severity": "major",
+      "category": "type",
+      "file": "tinyagent.py",
+      "line": 2642,
+      "summary": "Unused `# type: ignore[attr-defined]` on the `add_mcp_server` re-export.",
+      "detail": "mypy reports the suppression as `unused-ignore`. The `TinyAgent.add_mcp_server` attribute is now visible at module scope so the suppression is no longer needed. Remove the comment to keep `warn_unused_ignores = true` clean."
+    },
+    {
+      "severity": "major",
+      "category": "type",
+      "file": "tinyagent.py",
+      "line": 2667,
+      "summary": "Unused `# type: ignore[attr-defined]` on the `mcp.types.Tool` runtime import fallback.",
+      "detail": "mcp is installed in pyproject.toml; the `try/except` no longer needs the suppression. Remove to keep CI clean."
+    },
+    {
+      "severity": "major",
+      "category": "type",
+      "file": "tinyagent.py",
+      "line": 2672,
+      "summary": "Unused `# type: ignore[no-redef,misc]` on the `MCPTool` fallback class.",
+      "detail": "The fallback class does not actually trigger either rule under the installed mcp. Remove the suppression."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 32,
+      "summary": "Import block is un-sorted (I001 fixable with ruff --fix).",
+      "detail": "The stdlib import block is reorderable. Single-line `ruff check --fix tinyagent.py` resolves."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 34,
+      "summary": "Unused `# noqa: F401` directive on `import asyncio` (RUF100).",
+      "detail": "asyncio is used at runtime, so F401 never fires — the noqa from the stub-era imports is dead. Bulk-clean: remove all six RUF100 noqa comments on lines 34/35/37/41/43/48."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 62,
+      "summary": "Unused import `typing_extensions.TypeAlias` (F401).",
+      "detail": "Module comment says it is used at type hints, but no actual usage is present."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 77,
+      "summary": "Unused module import `pydantic` (F401).",
+      "detail": "`pydantic` namespace is imported but only `BaseModel`, `ConfigDict`, `Field` are referenced via the `from pydantic import ...` line."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 78,
+      "summary": "Unused import `pydantic.Field` (F401).",
+      "detail": "Not referenced anywhere in tinyagent.py — was imported defensively."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 86,
+      "summary": "Unused import `mcp.types.Tool` (F401).",
+      "detail": "Mentioned by name only in the TYPE_CHECKING block; never referenced."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 75,
+      "summary": "Commented-out code (ERA001).",
+      "detail": "Plan commentary on import layout. Not executed. Informational."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 92,
+      "summary": "`__all__` list is not sorted (RUF022).",
+      "detail": "Two `__all__` declarations in the module (line 92 and line 2689); ruff expects sorted strings. Cosmetic."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 220,
+      "summary": "Exception class `AgentCancel` violates N818 (should end with `Error`).",
+      "detail": "Deliberate per plan §2 section 6 — `AgentCancel` is part of the public API surface and is not an error class. Add `N818` to the per-file ignores for the section, or document the carve-out in pyproject.toml."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 372,
+      "summary": "Use of `assert` detected in production code (S101).",
+      "detail": "Located inside `CallbackRegistry.dispatch_sync`. Tests do not exercise the `assert` branch but it is defensible as a precondition guard; consider downgrading to a typed raise, or ignore S101 in non-test paths."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 822,
+      "summary": "`import math` inside `_eval_arithmetic` (PLC0415).",
+      "detail": "Cosmetic; standard library, no side effects, lazy-load is intentional to keep tool-specific imports near use. Move to module top if lint-cleanliness matters."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 1074,
+      "summary": "Inline `import` inside function (PLC0415).",
+      "detail": "Likely a deferred runtime import inside `MCPServer.connect` or similar. Confirm the deferred semantics and either leave with a `noqa` or hoist."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 1312,
+      "summary": "f-string inside `raise` (EM102).",
+      "detail": "Per project style: assign the message to a local first. Two additional EM102 sites at lines 1318/2171/2184/2192 — same cosmetic fix."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 1877,
+      "summary": "Line too long (105 > 100, E501).",
+      "detail": "Single source file line-length violation. Wrap or reformat."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 1513,
+      "summary": "Too many return statements (8 > 6, PLR0911).",
+      "detail": "Inside the pricing cost-estimation function. Could collapse branches or extract helpers. Cosmetic relative to the strict ruff config."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 908,
+      "summary": "Async function declared with a `timeout` parameter (ASYNC109).",
+      "detail": "This is the canonical `http_get` tool signature with a timeout parameter — the rule wants `AnyIO`/`asyncio.timeout`. Informational; intentionally exposed for tool consumers."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 1009,
+      "summary": "`MCPServer.__slots__` is not sorted (RUF023).",
+      "detail": "Cosmetic; sort the tuple alphabetically."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 49,
+      "summary": "Import `Callable`/`Coroutine`/`AsyncIterator` from `collections.abc` (UP035).",
+      "detail": "Python 3.11+ moved these to `collections.abc`; `typing.AsyncIterator` is deprecated in 3.12+. Cosmetic but forward-compatible cleanup."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 1148,
+      "summary": "`MCPServer.__aenter__` should return `self` (PYI034).",
+      "detail": "Plan §2 section 11 says the return-type is `MCPServer`; confirm `__aenter__` matches `self`. May be a TypedDict / type-alias mismatch."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 472,
+      "summary": "Many `Any` annotations on Context fields (ANN401 x10 in production code).",
+      "detail": "The `Context = SimpleNamespace(...)` design uses dynamic typing by intention (per plan §2 section 8). Cosmetic under strict ruff; consider adopting `TypedDict`/dataclass or adding `# noqa: ANN401` annotations."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 2628,
+      "summary": "Private-member access on `self._callbacks._loop` from `agent.run()` (SLF001).",
+      "detail": "Required by the design (sync wrapper must pin the worker-thread loop on the registry). Two SLF001 sites in `tinyagent.py`: 2628 and 2635. Add `# noqa: SLF001` or accept the noise."
+    },
+    {
+      "severity": "minor",
+      "category": "complexity",
+      "file": "tinyagent.py",
+      "line": 1513,
+      "summary": "Branch/return count exceeds ruff PLR0911/PLR0912 limits.",
+      "detail": "Pricing function is the longest per-file function. Could be split into `pricing_fn(pricing_fn_callable, pricing, model_str)` + `pricing_table(pricing, model_str)` helpers."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "examples/inproc_mcp_echo.py",
+      "line": 34,
+      "summary": "Import block un-sorted plus F401/PLR0402/EM102/SIM105 (5 findings).",
+      "detail": "Test fixture; ruff check passes `--fix` cleanly. Five auto-fixable sites in one file."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tests/conftest.py",
+      "line": 25,
+      "summary": "`from tinyagent import ...` inside a function (PLC0415 x2).",
+      "detail": "Lazy module import to avoid a heavy-import cycle if `tinyagent` is already loaded. Acceptable but inconsistent with PEP 8."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tests/conftest.py",
+      "line": 5,
+      "summary": "Docstring contains ambiguous EN DASH (RUF002).",
+      "detail": "Cosmetic; replace `–` with `-`."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tests/test_otel.py",
+      "line": 359,
+      "summary": "No newline at end of file (W292).",
+      "detail": "Single newline missing. Trivial fix."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tests/test_otel.py",
+      "line": 326,
+      "summary": "Local variable `agent_span` assigned but never used (F841).",
+      "detail": "Dead local in test body — likely a leftover from refactoring."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tests/test_exceptions.py",
+      "line": 34,
+      "summary": "Line too long (106 > 100, E501).",
+      "detail": "Plus 5 more E501 sites in test files: test_mcp_stdio.py:306, test_agent_loop.py:438, test_exceptions.py:40/140. Wrap or break."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tests/test_agent_init.py",
+      "line": 127,
+      "summary": "Magic-number comparisons against constants (PLR2004 x6).",
+      "detail": "78 PLR2004 hits across tests; the strict ruff rule conflicts with the project's style of asserting on concrete defaults. Either add PLR2004 to the per-file ignores for tests/ or replace literals with module constants."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tests/test_callback_registry.py",
+      "line": 102,
+      "summary": "Private-member access on `CallbackRegistry._hooks` / `_loop` (SLF001 x22 in test_callback_registry.py).",
+      "detail": "Tests deliberately introspect internal storage to validate the dict-backed storage model per plan §5 / §0 C5. Add SLF001 to the tests' per-file ignores."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tests/integration/test_e2e_anyllm.py",
+      "line": 291,
+      "summary": "`getattr(trace, '_TRACER_PROVIDER_SET_ONCE', None)` is intrinsic to the integration smoke test.",
+      "detail": "Single SLF-style access; acceptable in tests but contributes to the overall noise count."
+    },
+    {
+      "severity": "minor",
+      "category": "lint",
+      "file": "tinyagent.py",
+      "line": 2685,
+      "summary": "Repeated `__all__` declaration at file footer (RUF022).",
+      "detail": "Plan §2 says '__all__ re-affirmation' at the footer; ruff treats this as a duplicate unsorted list. Either drop the footer declaration or sort and consolidate."
+    },
+    {
+      "severity": "info",
+      "category": "secret-scan",
+      "file": "(git diff HEAD)",
+      "line": null,
+      "summary": "No secrets detected in changed files.",
+      "detail": "Scanned for sk-/ghp_/AKIA tokens and hard-coded IP patterns; none found."
+    },
+    {
+      "severity": "info",
+      "category": "anti-pattern",
+      "file": "(whole tree)",
+      "line": null,
+      "summary": "Anti-pattern grep checks all pass.",
+      "detail": "No bare `type: ignore` (must be `type: ignore[code]`), no string-based `@patch(...)` decorators, no `unittest.TestCase` classes, no functional `pip install` in code (only in test docstrings/comments)."
+    },
+    {
+      "severity": "info",
+      "category": "lint",
+      "file": "tests/",
+      "line": null,
+      "summary": "Tests carry 357 ruff findings dominated by SLF001 (x180) and ANN401 (x102).",
+      "detail": "Per the strict `extend-select = [\"ALL\"]` config; tests would benefit from additional per-file-ignores (ANN, SLF, PLR, INP, SIM, FBT, ASYNC, ERA, PT) to align ruff with the test-helper conventions used in code comments (`# narrow via cast — no getattr/hasattr`)."
+    },
+    {
+      "severity": "info",
+      "category": "syntax",
+      "file": "tinyagent.py",
+      "line": null,
+      "summary": "`python3 -m py_compile tinyagent.py` passes cleanly.",
+      "detail": "Module imports under `python3` without warnings; `tinyagent.calculate` and `tinyagent.http_get` resolve."
+    }
+  ],
+  "blocker_count": 0,
+  "major_count": 3,
+  "minor_count": 22,
+  "note_counts": {
+    "ruff_total_findings": 454,
+    "ruff_in_source_tinyagent_py": 88,
+    "ruff_in_tests": 357,
+    "ruff_in_examples": 9,
+    "ruff_dominant_categories": {
+      "SLF001": 180,
+      "ANN401": 102,
+      "PLR2004": 50,
+      "INP001": 23,
+      "SIM117": 14
+    },
+    "mypy_errors_after_deps_installed": 3
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "decision": "approve",
+  "summary": "All four round-3 majors (M1 break-vs-continue, M2 hook signature, M3 CallbackRegistry storage, M4 tool_choice retry) and all three round-3 minors (m5 src/__init__.py, m6 ToolCall TypedDict, m7 flat py-modules layout) are genuinely closed, with the §2 outline and §8 pseudocode now in lockstep and each fix bound to a TDD test in §13. A fresh adversarial pass surfaced only minor, non-blocking gaps (self-contradictory 'counts toward max_turns' wording on the retry, an underspecified AgentTrace-retrieval path given run() returns a bare str, and a sync/async bridge that is test-gated but may need adjustment at implementation time). None are spec violations and none prevent a fresh implementer from shipping. The plan is good enough to ship.",
+  "revision_audit": [
+    {
+      "issue_id": "M1",
+      "status": "fixed",
+      "evidence": "§2 §15 run_async loop (line 312) uses `break  # <-- round-3 M1 fix; short-circuit`; §8 pseudocode (line 796) uses `break  # <-- round-3 M1 fix`; §8 rule (b) at line 829 states 'short-circuit the rest of the turn via break. No subsequent tool call in the same turn executes'; §13 cross-cutting risk #11 (line 1304) binds break-not-continue to T12a; T12a acceptance (line 1225) and T12a description in §11 (line 986) require `[final_answer, calculate]` in one turn to result in ONLY final_answer executing. The outline and pseudocode agree."
+    },
+    {
+      "issue_id": "M2",
+      "status": "fixed",
+      "evidence": "§2 §7 (lines 187-194): 'Sync hook: Callable[[Context], None]; Async hook: Callable[[Context], Awaitable[None]]. Return value is DISCARDED by dispatch. No **kwargs. No Context return.' §5 signatures block (lines 486-494) declares the identical shape and explicitly notes the earlier `(ctx, **kwargs) -> Context | None` was leftover upstream boilerplate. The old signature is purged from both §2 and §5. §13 cross-cutting risk #12 (line 1305) cites the canonical signature."
+    },
+    {
+      "issue_id": "M3",
+      "status": "fixed",
+      "evidence": "§0 C5 (lines 62-73) documents dict-backed storage; §2 §7 (lines 163-186) declares `self._hooks: dict[str, list[Callable]]`, `__slots__ = ('_hooks','_loop')`, five register_* methods, and dispatch via `self._hooks.get(name, ())` (comment 'NEVER getattr'); §5 dispatch_sync (line 549) and dispatch_async (line 560) both read `self._hooks.get(name, ())`; the attribute-style `cb.before_llm_call.append(fn)` form is explicitly dropped (§0 C5, §5 line 480). T6 (line 1188) includes a negative regression test asserting the attribute form raises AttributeError; §13 cross-cutting risk #12 (line 1305) binds this."
+    },
+    {
+      "issue_id": "M4",
+      "status": "fixed",
+      "evidence": "§2 §15 run_async outline (lines 270-295) and §8 pseudocode (lines 740-765) both implement the retry: empty response under tool_choice='required' flips tool_choice_for_next='auto' and re-issues via `continue` without appending the empty message; if the retry is also empty, raise AgentError. New rule (f) at §8 line 833. §13 cross-cutting risk #2 (line 1295) upgraded to concrete retry semantics. T12a-cross (lines 1229-1234) is a dedicated test with three scenarios (auto retry succeeds with trailing text; auto retry succeeds with tool_call; auto retry also empty -> AgentError)."
+    },
+    {
+      "issue_id": "m5",
+      "status": "fixed",
+      "evidence": "§13 T1 (line 1159) file list explicitly 'Does NOT include src/__init__.py'; §3 layout diagram (lines 361-407) shows tinyagent.py at repo root with no src/ tree; §0 C6 (lines 75-82) documents the flat-layout decision."
+    },
+    {
+      "issue_id": "m6",
+      "status": "fixed",
+      "evidence": "§2 §2 imports add `from typing import TypedDict` (line 114); §2 §8 (lines 196-203) declares `class ToolCall(TypedDict): id: str; type: Literal['function']; function: dict`; 'ToolCall' is present in both __all__ lists (§2 §3 line 120 and §10 line 927); Context.tool_call: ToolCall | None annotation is now backed by the type; T7 (line 1194) asserts the TypedDict shape via `from tinyagent import ToolCall`."
+    },
+    {
+      "issue_id": "m7",
+      "status": "fixed",
+      "evidence": "§3 pyproject fragment (lines 411-417) and §0 C6 lock `[tool.setuptools] py-modules = ['tinyagent']` with tinyagent.py at the repo root, explicitly no package-dir, no packages.find, no src/. §13 T15a (line 1272) locks the flat pyproject and its smoke test asserts py-modules resolution against the repo-root file with no src/ shadowing; §13 cross-cutting risk #13 (line 1306) binds the layout."
+    }
+  ],
+  "new_issues": [
+    {
+      "severity": "minor",
+      "category": "clarity",
+      "location": "plan.md §8 rule (f) line 833 and §2 §15 lines 281-283",
+      "summary": "The tool_choice retry's max_turns accounting is described in self-contradictory terms.",
+      "detail": "Rule (f) says the retry 'counts toward max_turns as one LLM call within the same iteration (not a separate turn)' while also stating 'the worst case is 2 x max_turns model calls'. Since the retry is implemented via `continue` (a new while-loop iteration), whether it consumes a turn depends on where `turn += 1` happens — which the pseudocode never shows. 'Counts toward max_turns' and 'not a separate turn' are in tension. The practical bound (2x max_turns model calls) is clear enough that an implementer can proceed, but the turn-increment location should be pinned down.",
+      "recommendation": "State explicitly where `turn` is incremented and confirm that the retry `continue` does NOT increment turn (so worst case is 2x max_turns model calls across max_turns turns). Drop the 'counts toward max_turns' phrasing or reword it to 'does not consume an additional turn'."
+    },
+    {
+      "severity": "minor",
+      "category": "api-completeness",
+      "location": "plan.md §8 (run_async returns str) vs §11 line 1109 and success criterion #3/#8",
+      "summary": "run_async returns a bare str, but the README example and tracing criterion assume the caller can retrieve an AgentTrace.",
+      "detail": "The §8 pseudocode returns `final_answer_value` / `str(message.content)` — a plain string. Yet §11's end-to-end example (line 1109) expects 'AgentTrace JSON serialized to trace.json', and success criterion #3 requires the caller to inspect emitted spans. The plan lists AgentTrace in __all__ and builds it via SpanEndCallback, but never specifies how the caller obtains the AgentTrace after run()/run_async() completes (no documented `agent.trace` attribute or result object). An implementer will have to invent the retrieval surface.",
+      "recommendation": "Specify the retrieval path — e.g. attach `self._trace` and expose a read-only `agent.trace` (or return a small result object carrying both the answer string and the AgentTrace). Add it to §10 and a T-task acceptance criterion. This is trivial to add and does not block, but should be pinned before implementation."
+    },
+    {
+      "severity": "minor",
+      "category": "correctness-risk",
+      "location": "plan.md §5 Sync/async dispatch (lines 519-566)",
+      "summary": "The dispatch_sync bridge (run_coroutine_threadsafe against the pinned loop) can deadlock if the coroutine is scheduled onto the same loop the caller is already running on; the mechanism is test-gated but may need adjustment at implementation time.",
+      "detail": "The design pins the worker-thread loop and, for async hooks encountered in the sync path, schedules them via `asyncio.run_coroutine_threadsafe(coro, self._loop)` then blocks on `future.result()`. That pattern is only safe when the caller runs on a DIFFERENT thread than self._loop. If run_async_in_sync executes the loop body on the same thread/loop that dispatch_sync is invoked from, `future.result()` blocks the loop and deadlocks. In practice the async loop body already runs on an event loop, so `dispatch_async` (await directly) covers both run() and run_async(), which suggests dispatch_sync may be unnecessary. This does not block because T6 and T12c ('asserts both directions') will surface a hang during implementation and force the correct pattern, but the plan should not assert the mechanism is settled.",
+      "recommendation": "During T6/T12c, verify the actual `any_llm.utils.aio.run_async_in_sync` threading model before committing to run_coroutine_threadsafe. If the loop body runs on the pinned loop's own thread, prefer awaiting async hooks directly via dispatch_async and drop the threadsafe bridge. Keep the 'both directions' test as the gate."
+    }
+  ],
+  "ship_readiness": {
+    "verdict": "ready",
+    "blocking_concerns": []
+  },
+  "strengths": [
+    "Every round-3 major (M1, M2, M3, M4) is closed with the §2 outline and §8 pseudocode now in verified lockstep — the round-3 loop-body-consistency and CallbackRegistry-surface verifiers did real work and the divergences the round-3 review caught are gone.",
+    "M3 is enforced end-to-end: dict-backed storage in §0 C5 + §2 §7 + §5, plus a negative regression test in T6 that asserts the old attribute-style API raises AttributeError — this locks the single canonical mechanism against silent reintroduction.",
+    "M1's break fix is bound at three layers (§2 outline, §8 pseudocode rule (b), T12a acceptance test feeding [final_answer, calculate]) so an implementer cannot regress to the leaky `continue`.",
+    "M4's retry is fully specified with its own cross-cut test task (T12a-cross) covering all three empty-response branches, keeping T12a within its LOC budget.",
+    "The pricing canonical rule (float | None, omit-when-unknown, no (0.0,0.0) fallback), MCP exception taxonomy, and OTel library pattern from earlier rounds remain internally consistent — no regressions introduced by the round-3 edits.",
+    "§0 Conflict Resolutions (C1-C6) and the 13-item cross-cutting risk register make the plan self-contained and TDD-enforceable; a fresh implementer can read §0 + §13 and know both what was decided and which test guards it."
+  ]
+}
