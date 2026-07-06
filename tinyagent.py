@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio  # noqa: F401  # populated in T11+
 import contextlib  # noqa: F401
+from contextlib import asynccontextmanager  # T14: add_mcp_server uses @asynccontextmanager
 import dataclasses  # noqa: F401
 import functools  # T10: functools.wraps for synthesised MCP tool callables
 from functools import cached_property  # T7: AgentTrace.tokens / .cost roll-ups
@@ -48,6 +49,7 @@ import warnings  # noqa: F401
 from typing import (
     TYPE_CHECKING,
     Any,
+    AsyncIterator,
     Callable,
     Coroutine,
     Protocol,
@@ -2317,9 +2319,77 @@ class TinyAgent:
             return final_answer_value or ""
         return None
 
-    async def add_mcp_server(self, server: Any) -> Any:
-        """Stub: returns an async context manager of synthesised tools. Lands in T14."""
-        raise NotImplementedError
+    @asynccontextmanager
+    async def add_mcp_server(
+        self, server: MCPServer
+    ) -> AsyncIterator[list[Callable[..., Any]]]:
+        """Register an MCP server for the lifetime of an ``async with`` block.
+
+        Plan §10 Form A (preferred for multi-server sessions):
+
+            async with agent.add_mcp_server(server) as tools:
+                # ``tools`` is the list of synthesised tool callables
+                # ``agent._clients`` is populated with each tool by name
+                ...
+
+        On enter:
+          1. Calls ``server.connect()`` (T10) which spawns the stdio
+             subprocess, opens a ``ClientSession``, and populates
+             ``server.tools`` with one synthesised callable per
+             advertised MCP tool.
+          2. Inserts each synthesised tool into ``self._clients`` under
+             its MCP tool name, so the agent loop's tool dispatcher
+             (``_dispatch_tool``) can find it.
+
+        On exit (always runs, even if the body raises):
+          1. Removes the synthesised tools from ``self._clients`` so a
+             later ``run_async`` cannot accidentally invoke a server
+             that has been torn down.
+          2. Calls ``server.cleanup()`` which drains the exit stack
+             and terminates the subprocess group.
+
+        The yielded value is a snapshot list of the synthesised
+        callables captured at ``connect()`` time. Callers should NOT
+        rely on this list surviving past the ``async with`` block.
+
+        Plan §10 Form B (explicit register / cleanup) is also
+        supported: ``cm = agent.add_mcp_server(server)`` followed by
+        ``await cm.__aenter__()`` and ``await cm.__aexit__(None, None,
+        None)`` produces the same lifecycle. The ``async with`` form
+        is the canonical spelling.
+
+        Parameters
+        ----------
+        server:
+            An ``MCPServer`` instance (T10). The server is connected
+            on enter and cleaned up on exit.
+
+        Yields
+        ------
+        ``list[Callable[..., Any]]``
+            A snapshot list of the synthesised tool callables for the
+            registered server, captured after ``server.connect()``
+            completes and BEFORE the cleanup branch runs.
+        """
+        await server.connect()
+        # Capture the tool names and synthesised callables BEFORE we
+        # insert them into ``_clients`` so the yielded list is a
+        # stable snapshot. ``server.tools`` is populated by
+        # ``connect()`` and is what the agent loop reads from.
+        tool_names = list(server.tools.keys())
+        synthesised_tools = list(server.tools.values())
+        for name in tool_names:
+            self._clients[name] = server.tools[name]
+        try:
+            yield synthesised_tools
+        finally:
+            # Always remove the synthesised entries from ``_clients``,
+            # even if the body raised. ``final_answer`` (seeded by the
+            # constructor) is left in place — it is not part of this
+            # server's namespace.
+            for name in tool_names:
+                self._clients.pop(name, None)
+            await server.cleanup()
 
 
 # Re-export `add_mcp_server` at module level for `from tinyagent import add_mcp_server`.
