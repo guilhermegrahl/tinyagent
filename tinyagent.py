@@ -58,20 +58,28 @@ from typing_extensions import TypeAlias  # used at type hints below
 
 # T8: opentelemetry-api is a hard dependency in pyproject.toml and _setup_tracing
 # (Section 13) is now in scope. Promote the runtime import so the function can
-# acquire tracers. Heavy third-party imports for sections still pending (T4+,
+# acquire tracers. T5 promotes simpleeval + httpx to runtime imports as well —
+# the calculate and http_get example tools (section 10) are now implemented and
+# use them directly. Heavy third-party imports for sections still pending (T4+,
 # T10, T11+) remain under TYPE_CHECKING below.
 from opentelemetry import trace as _otel_trace  # used in §13
 
 if TYPE_CHECKING:
     import any_llm
-    import httpx
     import mcp
     import pydantic
-    import simpleeval
     from mcp import ClientSession, StdioServerParameters  # noqa: F401
     from mcp.client.stdio import stdio_client  # noqa: F401
     from mcp.types import Tool as _MCPToolType
     from pydantic import BaseModel, ConfigDict, Field  # noqa: F401
+
+# T5: example tools use simpleeval and httpx at runtime. Promoting them
+# to module-level imports (they're already declared in pyproject.toml
+# dependencies) so the import failures surface at module load, not at
+# first tool invocation. TYPE_CHECKING entries above are removed because
+# the runtime imports below suffice for type-checker visibility.
+import httpx  # T5: http_get example tool
+import simpleeval  # T5: calculate example tool
 
 
 # =====================================================================
@@ -726,19 +734,211 @@ def _cast_argument(value: Any, param_annotation: Any) -> Any:
 # =====================================================================
 # Section 10 - Example tools (shipped, importable from top-level)
 # =====================================================================
+# T5: shipped example tools. The module is split into:
+#   - final_answer: bare termination function (NOT @tool-decorated).
+#     The agent loop recognises it by name and short-circuits when the
+#     LLM emits it; adding a JSON schema would route it through the
+#     normal tool-dispatch path and bypass the termination branch.
+#   - calculate:    @tool-decorated safe expression evaluator. Backed
+#     by simpleeval.SimpleEval so the LLM cannot reach dunders, builtin
+#     imports, or attribute lookups. Errors are returned as a string
+#     (the loop feeds the string back to the LLM, the loop continues).
+#   - http_get:     @tool-decorated async HTTP GET. Uses httpx.AsyncClient
+#     and truncates oversized responses so a 1 MB page cannot blow up
+#     the agent's context. Network errors are returned as a string.
+#
+# All three names are exported via __all__ (sections 3 and 17) and
+# importable as `from tinyagent import final_answer, calculate, http_get`.
+
+# Cap http_get response bodies at ~4KB. The exact value matches the
+# SPAN_LIMITS["tool_result"] budget in §4 so a single GET round-trip
+# fits in a single trace span without re-truncation.
+_HTTP_GET_MAX_CHARS: int = 4096
+_HTTP_GET_TRUNCATION_MARKER: str = "...[truncated]"
+
+
 def final_answer(answer: str) -> str:
-    """Bare termination tool: model calls this to end the loop cleanly."""
-    raise NotImplementedError
+    """Bare termination tool: the agent loop returns ``answer`` as the run's result.
+
+    The function body is a no-op identity: it does not evaluate, parse,
+    or transform its argument. The semantic role of ``final_answer`` is
+    to be the agent loop's termination signal — the loop sees the model
+    call this function name and short-circuits via ``break`` (round-3
+    M1, plan §8), returning ``answer`` to the caller. See §8 in the
+    plan for the loop-side wiring.
+
+    Parameters
+    ----------
+    answer:
+        The final answer the agent should return to its caller. Treated
+        as an opaque string — no eval, no formatting, no PII redaction.
+        Callers that need validation (PII redaction, length caps,
+        format checks) should hook the ``before_tool_execution`` /
+        ``after_tool_execution`` callbacks (round-3 M4 symmetry rule).
+
+    Returns
+    -------
+    The ``answer`` argument, unchanged.
+    """
+    return answer
 
 
+# Maximum nesting depth for the simpleeval AST. The default (no limit)
+# would let a prompt inject deeply-nested expressions; capping it at 32
+# keeps a malicious payload from blowing up the parser while still
+# leaving headroom for legitimate math.
+_CALC_MAX_NESTING: int = 32
+# Maximum string length for the simpleeval input. The LLM is unlikely
+# to ever emit a useful expression > 1 KB; anything larger is either a
+# probe or a runaway tool-call argument.
+_CALC_MAX_INPUT_CHARS: int = 1024
+
+
+def _eval_arithmetic(expression: str) -> str:
+    """Run a single simpleeval evaluation, returning the result as a string.
+
+    Pulled out of ``calculate`` to keep the tool wrapper under the
+    PLR0912 branch budget (ruff C901). ``calculate`` is now a thin
+    guard wrapper: validate the input length, call this helper, and
+    return. This helper raises simpleeval's own exceptions on failure;
+    the caller maps each exception class to an "Error: ..." string.
+    """
+    import math
+
+    evaluator = simpleeval.SimpleEval()
+    evaluator.max_node_count = 1000
+    evaluator.names.update(
+        {
+            "pi": math.pi,
+            "e": math.e,
+            "tau": math.tau,
+            "inf": math.inf,
+            "nan": math.nan,
+        }
+    )
+    evaluator.functions.update(
+        {
+            "abs": abs,
+            "round": round,
+            "min": min,
+            "max": max,
+            "sum": sum,
+            "pow": pow,
+        }
+    )
+    return str(evaluator.eval(expression, previously_parsed=None))
+
+
+@tool
 def calculate(expression: str) -> str:
-    """Stub: safe expression evaluator (simpleeval) lands in T5."""
-    raise NotImplementedError
+    """Safely evaluate an arithmetic expression and return the result as a string.
+
+    The implementation uses :class:`simpleeval.SimpleEval`, which parses
+    the input with the standard-library ``ast`` module and evaluates only
+    a fixed allow-list of operators, names (``pi``, ``e``, ``tau``),
+    and built-in functions (``abs``, ``round``, ``min``, ``max``,
+    ``sum``, ``pow``). It does NOT expose Python's ``eval`` / ``exec``,
+    the ``__import__`` builtin, attribute access, or method calls — a
+    prompt that asks for ``__import__('os').system('rm -rf /')`` is
+    rejected at parse time.
+
+    On any error (parse error, undefined name, division by zero,
+    nesting-depth exceeded, input too long, disallowed function) the
+    function returns the string ``"Error: <message>"`` rather than
+    raising. The agent loop feeds that string back to the LLM, which
+    can then self-correct on the next turn.
+
+    Parameters
+    ----------
+    expression:
+        A Python-style arithmetic expression, e.g. ``"2 + 3 * 4"`` or
+        ``"(1 + 2) * 3.5"``.
+
+    Returns
+    -------
+    The numeric result stringified via :func:`str`. Errors are
+    stringified as ``"Error: <exception message>"``.
+    """
+    if not isinstance(expression, str):
+        return f"Error: expression must be a string, got {type(expression).__name__}"
+    if len(expression) > _CALC_MAX_INPUT_CHARS:
+        return (
+            f"Error: expression too long "
+            f"({len(expression)} > {_CALC_MAX_INPUT_CHARS} chars)"
+        )
+    try:
+        return _eval_arithmetic(expression)
+    except (
+        simpleeval.FunctionNotDefined,
+        simpleeval.NameNotDefined,
+        simpleeval.OperatorNotDefined,
+        simpleeval.InvalidExpression,
+        ZeroDivisionError,
+        ValueError,
+        TypeError,
+        SyntaxError,
+    ) as exc:
+        return f"Error: {exc}"
+    except RecursionError as exc:
+        return f"Error: expression nested too deeply ({exc})"
+    except Exception as exc:  # noqa: BLE001 — last-resort safety net
+        # Catch-all so a buggy simpleeval release or a future
+        # exception subclass cannot crash the agent loop. The error
+        # string keeps the loop recoverable.
+        return f"Error: {exc}"
 
 
+@tool
 async def http_get(url: str, timeout: float = 10.0) -> str:
-    """Stub: httpx.AsyncClient GET lands in T5."""
-    raise NotImplementedError
+    """Fetch ``url`` over HTTP(S) and return the response body (truncated to ~4KB).
+
+    The implementation uses :class:`httpx.AsyncClient` with the
+    ``timeout`` parameter honoured as both connect and read timeout.
+    The response body is truncated to :data:`_HTTP_GET_MAX_CHARS`
+    characters so a 1 MB page cannot blow up the agent's context or
+    the ``gen_ai.tool.result`` span attribute budget. The truncation
+    marker is appended inside the budget so the returned string is
+    always ``len <= _HTTP_GET_MAX_CHARS + len(marker)``.
+
+    On any error (connection refused, DNS failure, timeout, non-2xx
+    status — actually 2xx pass through; 4xx/5xx return the body as
+    text so the LLM can see the error message) the function returns
+    ``"Error: <message>"`` rather than raising. The agent loop feeds
+    that string back to the LLM.
+
+    Parameters
+    ----------
+    url:
+        Absolute HTTP(S) URL to fetch.
+    timeout:
+        Per-operation timeout in seconds. Defaults to 10.0.
+
+    Returns
+    -------
+    The response body as a string, truncated to ~4KB. Errors are
+    stringified as ``"Error: <exception message>"``.
+    """
+    if not isinstance(url, str) or not url:
+        return "Error: url must be a non-empty string"
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        return f"Error: timeout must be a positive number, got {timeout!r}"
+    try:
+        async with httpx.AsyncClient(timeout=float(timeout)) as client:
+            response = await client.get(url)
+            # We do NOT raise_for_status() — a 404 or 500 still has a
+            # body the LLM can inspect on the next turn. The status
+            # code is available to the loop via the response object if
+            # needed; the tool contract is "return response text".
+            body = response.text
+    except httpx.HTTPError as exc:
+        return f"Error: {exc}"
+    except Exception as exc:  # noqa: BLE001 — last-resort safety net
+        return f"Error: {exc}"
+
+    if len(body) > _HTTP_GET_MAX_CHARS:
+        keep = max(0, _HTTP_GET_MAX_CHARS - len(_HTTP_GET_TRUNCATION_MARKER))
+        body = body[:keep] + _HTTP_GET_TRUNCATION_MARKER
+    return body
 
 
 # =====================================================================
