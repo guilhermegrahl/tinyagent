@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio  # noqa: F401  # populated in T11+
 import contextlib  # noqa: F401
 import dataclasses  # noqa: F401
+from functools import cached_property  # T7: AgentTrace.tokens / .cost roll-ups
 import json  # noqa: F401
 import logging
 import os  # noqa: F401
@@ -130,6 +131,15 @@ PROVIDER_EXTRA_ENV: dict[str, tuple[str, ...]] = {
     "vertex": ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"),
     "gemini": ("GOOGLE_API_KEY",),
 }
+
+# T7: OTel-style attribute names used by `AgentTrace` roll-ups. These mirror
+# the semconv constants upstream defines in `tracing/attributes.py`; we keep
+# the literal strings here (instead of importing opentelemetry-semconv) so the
+# roll-ups remain testable without a heavy runtime dependency. The full
+# constants table is added in T9.
+INPUT_TOK_ATTR: str = "gen_ai.usage.input_tokens"
+OUTPUT_TOK_ATTR: str = "gen_ai.usage.output_tokens"
+COST_ATTR: str = "gen_ai.usage.cost"
 
 
 # =====================================================================
@@ -254,20 +264,122 @@ def _create_tool_function(server: Any, tool: Any) -> Callable[..., Any]:
 # =====================================================================
 # Section 12 - AgentTrace / AgentSpan / TokenInfo / CostInfo
 # =====================================================================
+@dataclasses.dataclass(frozen=True)
 class AgentSpan:
-    """Stub: full implementation lands in T7."""
+    """A single OpenTelemetry-flavoured span tracked by `AgentTrace`.
+
+    Fields match the span attributes the loop writes in T9 (call_llm /
+    execute_tool / invoke_agent). `end_time` is `None` while the span is
+    open; the span-generation code sets it to a `time.time()` float when
+    the span closes.
+    """
+
+    name: str
+    attributes: dict[str, Any]
+    kind: str
+    parent_id: str | None
+    start_time: float
+    end_time: float | None = None
 
 
+@dataclasses.dataclass(frozen=True)
 class TokenInfo:
-    """Stub: input_tokens + output_tokens roll-up field."""
+    """Roll-up of token usage across `call_llm` spans in an `AgentTrace`.
+
+    `AgentTrace.tokens` returns a `TokenInfo` summing input/output tokens
+    across spans that actually carry the attributes — spans without the
+    attributes are skipped (their token counts are "unknown", not zero).
+    """
+
+    input_tokens: int
+    output_tokens: int
 
 
+@dataclasses.dataclass(frozen=True)
 class CostInfo:
-    """Stub: USD cost roll-up field."""
+    """Roll-up of USD cost across `call_llm` spans in an `AgentTrace`.
+
+    `AgentTrace.cost` returns a `CostInfo` summing cost only across spans
+    that carry the `gen_ai.usage.cost` attribute. The round-3 M6 fix
+    (canonical pricing rule) means unknown-cost spans are SKIPPED, never
+    treated as $0 — `CostInfo` is allowed to be all-zero when no spans
+    have the cost attribute.
+    """
+
+    input_cost_usd: float
+    output_cost_usd: float
+    total_cost_usd: float
 
 
+@dataclasses.dataclass(frozen=True)
 class AgentTrace:
-    """Stub: spans list + tokens/cost roll-ups land in T7."""
+    """Collection of spans emitted by a single agent run, with roll-ups.
+
+    `tokens` and `cost` are `cached_property` roll-ups computed lazily on
+    first access. Both are read-only views of the underlying span list;
+    the roll-ups only consider `call_llm` spans that carry the relevant
+    attributes (spans without the attributes are skipped, not treated
+    as zero).
+    """
+
+    spans: list[AgentSpan]
+
+    @cached_property
+    def tokens(self) -> TokenInfo:
+        """Sum input/output tokens across `call_llm` spans WITH token attrs.
+
+        Spans missing `gen_ai.usage.input_tokens` / `output_tokens` are
+        skipped — partial sums are still meaningful (a span that records
+        only input_tokens still contributes its input to the roll-up).
+        """
+        in_total = 0
+        out_total = 0
+        for span in self.spans:
+            if span.name != "call_llm":
+                continue
+            attrs = span.attributes
+            in_val = attrs.get(INPUT_TOK_ATTR)
+            out_val = attrs.get(OUTPUT_TOK_ATTR)
+            if in_val is None and out_val is None:
+                continue
+            if in_val is not None:
+                in_total += int(in_val)
+            if out_val is not None:
+                out_total += int(out_val)
+        return TokenInfo(input_tokens=in_total, output_tokens=out_total)
+
+    @cached_property
+    def cost(self) -> CostInfo:
+        """Sum USD cost across `call_llm` spans WITH `gen_ai.usage.cost`.
+
+        Round-3 M6: unknown-cost spans are SKIPPED. The cost attribute is
+        a single rolled-up USD total (input + output combined per the
+        plan's pricing rule); we report that figure as `total_cost_usd`
+        and leave the per-direction breakdown at zero — the upstream
+        per-direction split was deprecated when the custom cost
+        attribute was consolidated into a single total.
+        """
+        total = 0.0
+        any_with_cost = False
+        for span in self.spans:
+            if span.name != "call_llm":
+                continue
+            cost_val = span.attributes.get(COST_ATTR)
+            if cost_val is None:
+                continue
+            total += float(cost_val)
+            any_with_cost = True
+        if not any_with_cost:
+            return CostInfo(
+                input_cost_usd=0.0,
+                output_cost_usd=0.0,
+                total_cost_usd=0.0,
+            )
+        return CostInfo(
+            input_cost_usd=total,
+            output_cost_usd=0.0,
+            total_cost_usd=total,
+        )
 
 
 # =====================================================================
