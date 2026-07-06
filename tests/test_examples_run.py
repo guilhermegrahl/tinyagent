@@ -267,19 +267,67 @@ def test_pyproject_python_and_license() -> None:
 
 
 # ---------------------------------------------------------------------
-# Stub: owned by T15b (example scripts). Added now as a placeholder so the
-# pytest collection has a known test name to wire T15b into.
+# T15b: example scripts (calculator_mcp_stdio, http_demo, tracing_otlp)
 # ---------------------------------------------------------------------
-def test_each_example_runs_under_mocked_llm() -> None:
-    """Stub for T15b: smoke-run each ``examples/*.py`` against a mocked LLM.
+# Canonical list of example scripts that ship with T15b. The list is the
+# authoritative source of truth — keep it in sync with `examples/*.py`.
+_EXAMPLE_MODULES: tuple[str, ...] = (
+    "examples.calculator_mcp_stdio",
+    "examples.http_demo",
+    "examples.tracing_otlp",
+)
 
-    Owned by T15b — implementation lands in that task. Marked
-    ``pytest.xfail`` here so the test name is reserved and the file shows a
-    clear "pending" status in CI rather than silently passing as a no-op.
+
+@pytest.mark.parametrize("module_name", _EXAMPLE_MODULES)
+def test_each_example_runs_under_mocked_llm(module_name: str) -> None:
+    """Import each ``examples/*.py`` script and assert it loads cleanly.
+
+    Per plan §13 T15b: every example must ``importlib.import_module`` without
+    raising. We do NOT exercise the agent loop here — that requires an LLM
+    key and is covered by T16 integration tests under ``ANY_LLM_TEST_MODEL``.
+    This test just locks the import-time contract:
+
+    - No top-level exceptions when the module is imported.
+    - The module object is non-``None`` and exposes ``__file__``.
     """
-    pytest.xfail(
-        "T15b-owned: example scripts (calculator_mcp_stdio, http_demo, "
-        "tracing_otlp) not yet shipped"
+    sys.modules.pop(module_name, None)  # force a fresh import
+    module = importlib.import_module(module_name)
+    assert module is not None, f"{module_name} imported as None"
+    assert getattr(module, "__file__", None), (
+        f"{module_name} has no __file__ attribute (top-level executable?)"
+    )
+
+
+def test_examples_use_register_api_only() -> None:
+    """No example script may use the dropped ``cb.before_llm_call.append(...)`` form.
+
+    Per plan §0 C5 (round-3 M3 closure): users MUST use ``register_*`` methods.
+    The attribute-storage form is forbidden and the ``CallbackRegistry`` itself
+    raises ``AttributeError`` for that access pattern (see T6). This scan locks
+    the same invariant at the example layer: any ``cb.<hook_name>.append(...)``
+    substring under ``examples/`` is a regression.
+    """
+    examples_dir = REPO_ROOT / "examples"
+    forbidden_pattern = ".append("
+    hook_attrs = (
+        "before_llm_call",
+        "after_llm_call",
+        "before_tool_execution",
+        "after_tool_execution",
+        "on_error",
+    )
+    violations: list[str] = []
+    for path in sorted(examples_dir.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            for hook in hook_attrs:
+                needle = f".{hook}{forbidden_pattern}"
+                if needle in line:
+                    violations.append(f"{path}:{line_no}: {line.strip()}")
+    assert not violations, (
+        "Examples MUST use the register_* API only. The following lines use "
+        "the dropped cb.<hook_name>.append(...) form (round-3 M3):\n  "
+        + "\n  ".join(violations)
     )
 
 
