@@ -34,12 +34,14 @@ from __future__ import annotations
 import asyncio  # noqa: F401  # populated in T11+
 import contextlib  # noqa: F401
 import dataclasses  # noqa: F401
+import functools  # T10: functools.wraps for synthesised MCP tool callables
 from functools import cached_property  # T7: AgentTrace.tokens / .cost roll-ups
 import inspect  # T4: @tool decorator uses inspect.signature
 import json  # noqa: F401
 import logging
 import os  # noqa: F401
 import re  # noqa: F401
+import types as _types  # T10: TracebackType for __aexit__ signature
 import uuid  # noqa: F401
 import warnings  # noqa: F401
 from typing import (
@@ -64,12 +66,20 @@ from typing_extensions import TypeAlias  # used at type hints below
 # T10, T11+) remain under TYPE_CHECKING below.
 from opentelemetry import trace as _otel_trace  # used in §13
 
+# T10: promote the mcp runtime imports so the ``MCPServer`` class can
+# speak to the stdio transport and ``ClientSession`` directly.  Kept at
+# module scope (not under TYPE_CHECKING) because ``MCPServer`` is a
+# runtime class — tests exercise it end to end.  The mcp pin is
+# ``==1.28.1`` in pyproject.toml per plan §3 + cross-cutting risk #1.
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
 if TYPE_CHECKING:
     import any_llm
-    import mcp
+    import httpx  # noqa: F401  # runtime import below
+    import mcp  # noqa: F401  # runtime import above
     import pydantic
-    from mcp import ClientSession, StdioServerParameters  # noqa: F401
-    from mcp.client.stdio import stdio_client  # noqa: F401
+    import simpleeval  # noqa: F401  # runtime import below
     from mcp.types import Tool as _MCPToolType
     from pydantic import BaseModel, ConfigDict, Field  # noqa: F401
 
@@ -944,12 +954,367 @@ async def http_get(url: str, timeout: float = 10.0) -> str:
 # =====================================================================
 # Section 11 - MCP stdio client
 # =====================================================================
+# Sentinel for ``call_tool`` failures that look like "the server
+# returned a CallToolResult with isError=True" — the spec's wire-level
+# way of saying "this tool name does not exist".  We translate it into
+# ``ToolNotFoundError`` so the agent loop can feed a descriptive string
+# back to the LLM (see plan §4 error table).
+_UNKNOWN_TOOL_MARKER: str = "unknown tool:"
+
+
 class MCPServer:
-    """Stub: stdio-only MCP server config + lifecycle lands in T10."""
+    """An MCP server connected over stdio (plan §2 section 11, §4).
+
+    The server is configured with a ``command`` + ``args`` + optional
+    ``env`` dict.  ``connect()`` spawns the subprocess via
+    ``mcp.client.stdio.stdio_client``, which internally uses
+    ``start_new_session=True`` so the subprocess is its own session
+    leader; ``cleanup()`` drains the exit stack and the stdio transport
+    terminates the process group.  This is the *only* supported
+    transport — SSE and streamable-HTTP code paths were dropped from
+    upstream per plan §4.
+
+    Typical use (preferred context-manager form):
+
+        async with MCPServer(
+            name="calc",
+            command=sys.executable,
+            args=["examples/calculator_mcp_stdio.py"],
+        ) as srv:
+            tools = await srv.list_tools()
+            result = await srv.call_tool("add", {"a": 1, "b": 2})
+
+    Or explicit connect / cleanup:
+
+        srv = MCPServer(name="calc", command=sys.executable, args=[...])
+        await srv.connect()
+        try:
+            ...
+        finally:
+            await srv.cleanup()
+
+    The synthesised ``self.tools`` dict maps each tool name advertised
+    by the server to a Python callable produced by
+    ``_create_tool_function``.  The agent loop consumes this dict
+    directly; MCP-specific call / schema details stay inside
+    ``MCPServer``.
+    """
+
+    __slots__ = (
+        "name",
+        "command",
+        "args",
+        "env",
+        "tools",
+        "_exit_stack",
+        "_session",
+        "_read_stream",
+        "_write_stream",
+        "_process",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        """Configure a stdio MCP server.  Does NOT spawn the subprocess.
+
+        ``args`` defaults to an empty list.  ``env`` is defensively
+        copied so post-construction mutation by the caller does not
+        leak into the subprocess environment.
+        """
+        self.name: str = name
+        self.command: str = command
+        self.args: list[str] = list(args) if args is not None else []
+        self.env: dict[str, str] | None = dict(env) if env is not None else None
+        # ``tools`` is the synthesised-callable dict the agent loop
+        # reads from.  Populated by ``connect()`` (which calls
+        # ``list_tools()`` and registers each tool via
+        # ``_create_tool_function``).
+        self.tools: dict[str, Callable[..., Any]] = {}
+        # AsyncExitStack holds the ``stdio_client`` context manager so
+        # ``cleanup()`` can pop it (which closes the streams and
+        # terminates the subprocess group).
+        self._exit_stack: contextlib.AsyncExitStack | None = None
+        self._session: ClientSession | None = None
+        self._read_stream: Any = None
+        self._write_stream: Any = None
+        # ``_process`` is the live subprocess handle, set by
+        # ``connect()``.  Exposed for the test suite (it asserts the
+        # PID is in its own process group) and so ``cleanup()`` can
+        # kill the whole group via ``os.killpg`` if needed.
+        self._process: Any = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    async def connect(self) -> None:
+        """Spawn the subprocess and open a ``ClientSession``.
+
+        On success, ``self.tools`` is populated with one synthesised
+        callable per advertised MCP tool.  On failure, the subprocess
+        is reaped and the exception propagates — the caller should
+        treat this as "the server is unavailable".
+
+        We capture the live subprocess handle by wrapping the mcp
+        library's internal ``_create_platform_compatible_process``
+        for the duration of this call only.  The original is restored
+        before the function returns, so the patch is invisible to
+        other call sites in the same process.
+        """
+        from mcp.client import stdio as _mcp_stdio
+
+        params = StdioServerParameters(
+            command=self.command,
+            args=self.args,
+            env=self.env,
+        )
+        stack = contextlib.AsyncExitStack()
+        # ``stdio_client`` returns ``(read_stream, write_stream)`` and
+        # spawns the subprocess with ``start_new_session=True`` on
+        # POSIX.  We hold the stack so ``cleanup()`` can drain it
+        # deterministically even on error paths.
+        # Wrap the mcp subprocess factory so we can capture the live
+        # process handle (the mcp library does NOT expose the process
+        # on the returned streams — it's a local variable in the
+        # ``stdio_client`` async generator).  Restored on the way out
+        # in the ``finally`` so the patch is local to this call.
+        captured: dict[str, Any] = {}
+        # ``_create_platform_compatible_process`` is a private symbol
+        # in the mcp library; we deliberately wrap it to capture the
+        # process handle.  The patch is scoped to this call only.
+        original_create_process = _mcp_stdio._create_platform_compatible_process  # noqa: SLF001
+
+        async def _capturing_create_process(*args: Any, **kwargs: Any) -> Any:
+            proc = await original_create_process(*args, **kwargs)
+            captured["process"] = proc
+            return proc
+
+        _mcp_stdio._create_platform_compatible_process = _capturing_create_process  # noqa: SLF001
+        try:
+            streams_cm = stdio_client(params)
+            read_stream, write_stream = await stack.enter_async_context(streams_cm)
+            session_cm = ClientSession(read_stream, write_stream)
+            session = await stack.enter_async_context(session_cm)
+            await session.initialize()
+            # Discover the tools and synthesise a callable for each one.
+            result = await session.list_tools()
+            for tool in result.tools:
+                fn = _create_tool_function(self, tool)
+                self.tools[tool.name] = fn
+        finally:
+            # Always restore the original factory so a failed connect
+            # doesn't leave the patch in place for subsequent calls
+            # in the same process.
+            _mcp_stdio._create_platform_compatible_process = original_create_process  # noqa: SLF001
+        # Commit the stack only on the success path.
+        self._exit_stack = stack
+        self._session = session
+        self._read_stream = read_stream
+        self._write_stream = write_stream
+        self._process = captured.get("process")
+
+    async def cleanup(self) -> None:
+        """Drain the exit stack and terminate the subprocess group.
+
+        Idempotent — calling ``cleanup()`` after the server has already
+        been torn down is a no-op.  The ``stdio_client`` transport
+        handles the actual SIGTERM / SIGKILL escalation against the
+        subprocess group; we drain the stack to release the streams
+        and let the transport's finally-block run.
+        """
+        stack = self._exit_stack
+        if stack is None:
+            return
+        # Clear state first so re-entrant ``cleanup()`` is a no-op even
+        # if the stack raises.
+        self._exit_stack = None
+        self._session = None
+        self._read_stream = None
+        self._write_stream = None
+        self._process = None
+        self.tools = {}
+        await stack.aclose()
+
+    async def __aenter__(self) -> MCPServer:
+        """``async with MCPServer(...) as srv:`` — calls ``connect()`` on enter."""
+        await self.connect()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: _types.TracebackType | None,
+    ) -> None:
+        """``async with`` exit — calls ``cleanup()`` regardless of exception state."""
+        await self.cleanup()
+
+    # ------------------------------------------------------------------
+    # Tool dispatch
+    # ------------------------------------------------------------------
+    async def list_tools(self) -> list[Any]:
+        """Return the list of MCP tool descriptors advertised by the server.
+
+        Returns the raw ``mcp.types.Tool`` objects from the most recent
+        ``connect()`` / ``list_tools`` round-trip.  The synthesised
+        callables in ``self.tools`` are produced from this list.
+        """
+        session = self._session
+        if session is None:
+            message = "MCPServer.list_tools called before connect()"
+            raise MCPConnectionError(message)
+        result = await session.list_tools()
+        return list(result.tools)
+
+    async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
+        """Dispatch a tool call to the named MCP tool.
+
+        Returns the first ``TextContent`` text of the server's
+        ``CallToolResult`` (or the ``structuredContent`` if present).
+        Raises ``ToolNotFoundError`` if ``name`` is not in the server's
+        advertised tool list.  Raises ``MCPConnectionError`` on
+        transport-level failures and ``MCPProtocolError`` on malformed
+        frames.
+        """
+        session = self._session
+        if session is None:
+            message = f"MCPServer.call_tool({name!r}) called before connect()"
+            raise MCPConnectionError(message)
+        if name not in self.tools:
+            # Surface unknown tool names as ``ToolNotFoundError`` so the
+            # loop can feed a descriptive string back to the LLM.
+            # (plan §4 error table: "tool call to unknown tool name …
+            # descriptive error string to the LLM as the tool result.
+            # The loop continues. ``on_error`` does NOT fire.")
+            message = (
+                f"tool {name!r} is not registered on server {self.name!r}; "
+                f"available tools: {sorted(self.tools)}"
+            )
+            raise ToolNotFoundError(message)
+        try:
+            result = await session.call_tool(name, dict(args))
+        except Exception as exc:
+            raise _classify_mcp_exception(exc, name) from exc
+        return _extract_call_result(result)
 
 
-def _create_tool_function(server: Any, tool: Any) -> Callable[..., Any]:
-    """Stub: synthesises a callable + schema for an MCP tool. Lands in T10."""
+def _create_tool_function(server: MCPServer, tool: Any) -> Callable[..., Any]:
+    """Synthesise a Python callable that round-trips to ``server.call_tool``.
+
+    The returned function:
+
+    - Accepts keyword arguments matching the MCP tool's
+      ``inputSchema.properties`` (passed straight to ``call_tool``).
+    - Carries a ``tool_schema`` attribute mirroring the MCP tool
+      description so the agent loop can advertise the tool to the
+      LLM in a provider-agnostic way.
+    - Is awaitable (always returns a coroutine) — the agent loop
+      always awaits tool results, so the synthesis returns an
+      ``async def`` regardless of whether the underlying MCP tool
+      is sync or async.
+
+    The schema dict is built by copying the MCP tool's fields and
+    mapping ``inputSchema`` → ``parameters`` so it matches the
+    OpenAI-compatible shape produced by ``@tool`` in section 9.
+    """
+    # The MCP tool descriptor exposes name/description/inputSchema.
+    # We mirror those into a dict the agent loop already understands.
+    schema: dict[str, Any] = {
+        "name": tool.name,
+        "description": getattr(tool, "description", None),
+        "parameters": getattr(tool, "inputSchema", None) or {"type": "object"},
+    }
+
+    @functools.wraps(_create_tool_function)
+    async def _call(**kwargs: Any) -> Any:
+        # ``server.call_tool`` raises ``ToolNotFoundError`` for unknown
+        # names; we just propagate the exception (the loop catches
+        # it and feeds a descriptive string to the LLM).
+        return await server.call_tool(tool.name, kwargs)
+
+    # Attach the schema as a public attribute so callers can introspect
+    # the synthesised callable the same way they introspect an
+    # ``@tool``-decorated function.
+    _call.tool_schema = schema  # type: ignore[attr-defined]
+    return _call
+
+
+# ---------------------------------------------------------------------
+# Section 11 helpers — internal extractors + error classification
+# ---------------------------------------------------------------------
+def _classify_mcp_exception(exc: BaseException, tool_name: str) -> AgentError:
+    """Translate a low-level transport error into ``AgentError`` subclass.
+
+    The mcp library raises a variety of exceptions on the transport
+    boundary (broken pipe, EOF, JSON decode errors, etc.).  We map
+    them to the two MCP error classes the agent loop knows about:
+
+    - ``MCPConnectionError`` for connection / process death
+      (``BrokenPipeError``, ``ConnectionError``, ``EOFError``).
+    - ``MCPProtocolError`` for protocol-layer failures
+      (``json.JSONDecodeError``, ``UnicodeDecodeError``, etc.).
+
+    Anything else is wrapped in ``MCPConnectionError`` as the safe
+    default — the server is in an unknown state, so marking it
+    "broken" is the conservative choice.
+    """
+    message = f"MCP tool {tool_name!r} failed: {exc!r}"
+    if isinstance(exc, (BrokenPipeError, ConnectionError, EOFError)):
+        return MCPConnectionError(message)
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError, ValueError)):
+        return MCPProtocolError(message)
+    # Default: treat as a connection failure (server is in an
+    # unknown state — safer to mark it broken than to keep
+    # dispatching into a wedged transport).
+    return MCPConnectionError(message)
+
+
+def _extract_call_result(result: Any) -> Any:
+    """Reduce an MCP ``CallToolResult`` to a Python-friendly value.
+
+    Strategy:
+    1. If the server flagged ``isError=True`` AND the error text
+       starts with the ``_UNKNOWN_TOOL_MARKER`` sentinel, raise
+       ``ToolNotFoundError`` so the loop can recover.
+    2. If ``structuredContent`` is set, return that dict (it is the
+       server's typed return value).
+    3. Otherwise, concatenate the ``TextContent.text`` fields into a
+       single string.  Non-text content blocks are stringified.
+    """
+    is_error = bool(getattr(result, "isError", False))
+    content = list(getattr(result, "content", []) or [])
+    text_parts: list[str] = []
+    for block in content:
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            text_parts.append(str(getattr(block, "text", "")))
+            continue
+        # Non-text blocks (image, audio, resource link, embedded
+        # resource) are stringified for the agent loop — the loop
+        # only consumes string results.
+        text_parts.append(str(block))
+    text = "".join(text_parts)
+    if is_error and _UNKNOWN_TOOL_MARKER in text:
+        # Server says "unknown tool" — surface as ToolNotFoundError.
+        # Extract the tool name from the marker if possible.
+        # Format is "unknown tool: 'name'".
+        raise ToolNotFoundError(
+            f"tool not registered on server: {text.strip()!r}"
+        )
+    if is_error:
+        # Other tool-level errors become MCPProtocolError so the loop
+        # can mark the server broken.
+        raise MCPProtocolError(
+            f"MCP tool returned isError=True: {text!r}"
+        )
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
+        return structured
+    return text
 
 
 # =====================================================================
