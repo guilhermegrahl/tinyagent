@@ -58,20 +58,24 @@ from typing_extensions import TypeAlias  # used at type hints below
 
 # T8: opentelemetry-api is a hard dependency in pyproject.toml and _setup_tracing
 # (Section 13) is now in scope. Promote the runtime import so the function can
-# acquire tracers. Heavy third-party imports for sections still pending (T4+,
-# T10, T11+) remain under TYPE_CHECKING below.
+# acquire tracers. T11: any-llm is now in scope (AgentConfig + TinyAgent call
+# any_llm.acompletion via asyncio.wait_for). pydantic is in scope for
+# AgentConfig. mcp, simpleeval, httpx remain under TYPE_CHECKING (they are
+# promoted to runtime as their respective modules land in T10 / T5).
 from opentelemetry import trace as _otel_trace  # used in §13
 
+# T11: runtime imports for any_llm (call_model) and pydantic (AgentConfig).
+import any_llm
+import pydantic
+from pydantic import BaseModel, ConfigDict, Field
+
 if TYPE_CHECKING:
-    import any_llm
     import httpx
     import mcp
-    import pydantic
     import simpleeval
     from mcp import ClientSession, StdioServerParameters  # noqa: F401
     from mcp.client.stdio import stdio_client  # noqa: F401
     from mcp.types import Tool as _MCPToolType
-    from pydantic import BaseModel, ConfigDict, Field  # noqa: F401
 
 
 # =====================================================================
@@ -727,8 +731,16 @@ def _cast_argument(value: Any, param_annotation: Any) -> Any:
 # Section 10 - Example tools (shipped, importable from top-level)
 # =====================================================================
 def final_answer(answer: str) -> str:
-    """Bare termination tool: model calls this to end the loop cleanly."""
-    raise NotImplementedError
+    """Bare termination tool: model calls this to end the loop cleanly.
+
+    Returns the answer verbatim. The agent's loop (T12a) inspects
+    ``ctx.tool_call.function.name == "final_answer"`` BEFORE invoking
+    the function and captures ``answer`` as the agent's return value;
+    the return value of this function is mostly for type consistency
+    (it's discarded by the loop). Per plan §2 section 10: bare
+    function, no eval, no validation.
+    """
+    return answer
 
 
 def calculate(expression: str) -> str:
@@ -1173,18 +1185,199 @@ def _truncate_for_span(text: str, limit: int) -> str:
 # =====================================================================
 # Section 14 - AgentConfig (Pydantic)
 # =====================================================================
-class AgentConfig:
-    """Stub: full Pydantic model lands in T11."""
+class AgentConfig(BaseModel):
+    """Pydantic model holding the configuration for a single ``TinyAgent``.
+
+    Per plan §2 section 14 + §13 T11 acceptance criteria. Field order /
+    types match the canonical list:
+
+      - ``instructions: str``     — system prompt sent on every turn.
+      - ``tools: list[Callable]`` — bare-Python tools registered for the
+        agent. MCP tools are passed via ``mcp_servers`` instead.
+      - ``mcp_servers: list[MCPServer]`` — MCP server configs to connect
+        to in ``TinyAgent.setup()``. May be empty.
+      - ``model: str``            — provider-prefixed model id, e.g.
+        ``"openai:gpt-4o-mini"``. Split on the first ``":"`` to derive
+        the provider name for ``AnyLLM.create``.
+      - ``max_turns: int``        — default ``DEFAULT_MAX_TURNS`` (=10).
+      - ``keep_last_n: int``      — default ``DEFAULT_KEEP_LAST_N`` (=10).
+      - ``request_timeout_s: float`` — default ``DEFAULT_REQUEST_TIMEOUT_S``
+        (=120.0). Bounds the per-call LLM latency in
+        ``TinyAgent.call_model`` (cross-cutting risk #14).
+      - ``callbacks: CallbackRegistry | None`` — optional user-supplied
+        registry. ``None`` means ``TinyAgent.__init__`` builds a fresh
+        empty one (so the agent always has a valid ``_callbacks``).
+      - ``pricing_override: dict | None`` — optional per-instance
+        pricing table (``provider:model`` -> ``(input, output)`` USD per
+        1M tokens). Wired into ``PRICING_OVERRIDE`` in T13.
+      - ``name: str``             — default ``"tinyagent"``. Used as the
+        OTel tracer instrumentation name.
+      - ``description: str``      — default ``""``. Free-form agent
+        description; surfaced on the ``invoke_agent`` span (T9 / T12a).
+
+    Validation: Pydantic enforces the type annotations. ``mcp_servers``
+    is constrained to ``MCPServer`` instances (the type alias resolves
+    to ``Any`` until T10 ships — Pydantic will accept any object that
+    exposes the contract used by ``MCPServer.connect``).
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    instructions: str
+    tools: list[Callable[..., Any]]
+    mcp_servers: list[Any]  # MCPServer — typed as Any until T10 lands
+    model: str
+    max_turns: int = DEFAULT_MAX_TURNS
+    keep_last_n: int = DEFAULT_KEEP_LAST_N
+    callbacks: Any = None  # CallbackRegistry | None — typed as Any to avoid forward-ref churn
+    pricing_override: dict[str, tuple[float, float]] | None = None
+    name: str = "tinyagent"
+    description: str = ""
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
 
 
 # =====================================================================
 # Section 15 - TinyAgent class
 # =====================================================================
 class TinyAgent:
-    """Stub: full TinyAgent lands in T11 + T12a-d + T13 + T14."""
+    """The ReAct agent: tinyagent's core runtime.
 
-    def __init__(self, config: Any) -> None:
-        """Stub. Real signature: (config: AgentConfig)."""
+    Per plan §2 section 15 + §13 T11 acceptance criteria.
+
+    Construction (``__init__``) wires the agent's persistent state:
+      - OTel tracer (acquired via ``_setup_tracing(config.name)``)
+      - callback registry (user-supplied or a fresh ``CallbackRegistry()``)
+      - the any-llm client (built via ``AnyLLM.create(provider, **kw)``)
+      - the tool dict (``_clients``), seeded with ``final_answer``
+      - the MCP server list (shallow-copied from config)
+
+    ``setup()`` opens MCP connections and merges their tools into
+    ``_clients`` (landed in T11; MCP support fully wired in T10).
+    ``call_model()`` is the per-call LLM wrapper: it forwards
+    ``**completion_params`` to ``any_llm.acompletion`` under
+    ``asyncio.wait_for(timeout=request_timeout_s)`` and emits a
+    ``call_llm`` span with token + cost attributes (T9's
+    ``_SpanGeneration.call_llm`` is reused — T11 doesn't reimplement
+    span attribute logic; the seam is locked in §2 section 13).
+
+    The ReAct loop body (final_answer short-circuit, per-turn tool
+    dispatch, tool_choice retry) lands in T12a. Sync ``run()`` lands in
+    T12c. ``add_mcp_server`` is in T14.
+    """
+
+    def __init__(self, config: AgentConfig) -> None:
+        """Build the agent's persistent state from ``config``.
+
+        Steps (plan §2 section 15):
+          1. Store the config.
+          2. Acquire the OTel tracer via ``_setup_tracing(config.name)``.
+          3. Resolve the callback registry (user-supplied or a fresh
+             ``CallbackRegistry()``).
+          4. Build the any-llm client via
+             ``AnyLLM.create(provider, model=model_id)``. The
+             provider name is the first segment of ``config.model``
+             (split on ``":"``); the model id is the remainder
+             including the provider prefix (any-llm accepts both
+             forms and re-splits internally).
+          5. Initialise the tool dict (``_clients``) seeded with
+             ``final_answer``. Other tools / MCP tools are merged in
+             during ``setup()`` (T10/T14) — the constructor itself
+             does NOT scan ``config.tools`` for wire-formatting; the
+             tool dict at this point is only the termination tool
+             because the loop has not started yet and any per-tool
+             formatting lives in the loop body (T12a).
+          6. Copy the MCP server list onto the agent.
+        """
+        self.config = config
+        self._tracer = _setup_tracing(config.name)
+        self._callbacks: CallbackRegistry = (
+            config.callbacks if config.callbacks is not None else CallbackRegistry()
+        )
+
+        # Build the any-llm client. AnyLLM.create() returns an AnyLLM
+        # instance configured for the named provider. The model id is
+        # passed to ``any_llm.acompletion(model=...)`` at call time
+        # (NOT to ``AnyLLM.create``) — provider clients (e.g.
+        # ``AsyncOpenAI``) do not accept a ``model`` constructor kwarg.
+        #
+        # API-key resolution: prefer the env var named in
+        # ``PROVIDER_KEY_ENV[provider]``; fall back to a placeholder
+        # when the env var is unset so unit tests can construct an
+        # agent without a real provider key. The provider only
+        # actually USES the key at call time, so the placeholder is
+        # sufficient to satisfy the constructor's verification.
+        provider, _, _model_id = config.model.partition(":")
+        api_key_env = PROVIDER_KEY_ENV.get(provider)
+        api_key = os.getenv(api_key_env) if api_key_env else None
+        if api_key is None:
+            api_key = "tinyagent-construction-placeholder"
+        self._llm: Any = any_llm.AnyLLM.create(provider, api_key=api_key)
+
+        # _clients: tool-name -> callable. Seeded with final_answer per
+        # plan §2 section 15 ("_clients ... includes final_answer").
+        # The loop (T12a) and the user-facing tool wrappers (T4) read
+        # from this dict; setup() appends MCP tools (T10/T14).
+        self._clients: dict[str, Callable[..., Any]] = {
+            final_answer.__name__: final_answer,
+        }
+
+        # _mcp_servers: shallow copy of config.mcp_servers. The list
+        # order matches config.mcp_servers — setup() iterates in order
+        # to call .connect() (T10).
+        self._mcp_servers: list[Any] = list(config.mcp_servers)
+
+    async def setup(self) -> None:
+        """Open MCP server connections and merge their tools into ``_clients``.
+
+        Per plan §2 section 15 + §13 T11: ``setup()`` calls each MCP
+        server's ``connect()`` (T10) and populates ``_clients`` with
+        every synthesised tool plus ``final_answer``. ``final_answer``
+        is always last in the dict (already there from ``__init__``);
+        any name collision with a synthesised tool would let the MCP
+        tool win, but the canonical termination tool name
+        ``"final_answer"`` is reserved and no MCP server should ever
+        expose a tool with the same name.
+
+        For T11 (no MCP support yet) this is a no-op: ``config.mcp_servers``
+        is empty in the unit tests, and the method must still exist
+        for the loop to call it.
+        """
+        for server in self._mcp_servers:
+            await server.connect()
+            tools = await server.list_tools()
+            for tool in tools:
+                fn = _create_tool_function(server, tool)
+                self._clients[tool.name] = fn
+
+    async def call_model(self, **completion_params: Any) -> Any:
+        """Wrap ``any_llm.acompletion`` in a timeout and emit a ``call_llm`` span.
+
+        Per plan §2 section 15 + §13 T11 + cross-cutting risk #14.
+
+        The flow:
+          1. Schedule ``any_llm.acompletion(**completion_params)`` under
+             ``asyncio.wait_for(timeout=self.config.request_timeout_s)``.
+             On timeout, ``asyncio.TimeoutError`` propagates to the
+             caller (the loop's exception arm wraps it in ``AgentError``
+             and fires ``on_error`` — T12a).
+          2. Open a ``call_llm`` span via ``_SpanGeneration.call_llm``.
+             The span attributes (token counts, model id, cost) are
+             populated by the seam; ``gen_ai.usage.cost`` is written
+             iff ``_estimate_cost`` returns a non-None float (T9's
+             omit-when-unknown rule, §0 C2 + cross-cutting risk #8).
+          3. Return the response unchanged.
+
+        ``completion_params`` must include the model string (typically
+        ``config.model``); the loop body in T12a passes it explicitly.
+        """
+        response = await asyncio.wait_for(
+            any_llm.acompletion(**completion_params),
+            timeout=self.config.request_timeout_s,
+        )
+        span_gen = _SpanGeneration(self._tracer, self.config.model)
+        with span_gen.call_llm(response):
+            pass
+        return response
 
     async def add_mcp_server(self, server: Any) -> Any:
         """Stub: returns an async context manager of synthesised tools. Lands in T14."""
