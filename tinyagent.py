@@ -154,24 +154,57 @@ DEFAULT_PRICING: dict[str, tuple[float, float]] = {
 class AgentError(Exception):
     """Base class for every exception this library raises.
 
-    Callers can catch `AgentError` to handle every internal failure mode.
+    Catch ``AgentError`` to handle every internal failure mode in one place.
+    Specific subclasses (below) carry semantic meaning so callers can branch
+    on the failure type when they need to (e.g. distinguish an MCP transport
+    drop from a user-initiated abort).
     """
 
 
 class AgentCancel(AgentError):
-    """Raised by hooks (canonical 5-hook set) to terminate the agent loop."""
+    """Raised by a hook to terminate the agent loop.
+
+    Any of the canonical 5 hooks (``before_llm_call``, ``after_llm_call``,
+    ``before_tool_execution``, ``after_tool_execution``, ``on_error``) may
+    raise ``AgentCancel`` to short-circuit the run; the loop unwinds and the
+    exception propagates out of ``TinyAgent.run`` / ``run_async`` unchanged.
+    ``AgentCancel`` is **not** routed through ``on_error`` — the user
+    explicitly aborted, so it is not an error in the observability sense.
+    """
 
 
 class ToolNotFoundError(AgentError):
-    """Raised internally when a tool call targets an unregistered name."""
+    """Raised when a tool call targets a name that is not registered.
+
+    The agent's loop catches this specific subclass and feeds a descriptive
+    string back to the LLM (so the model can self-correct on the next
+    turn). ``on_error`` does **not** fire — this is a recoverable in-band
+    signal, not an exception escaping the loop body. If the call originates
+    from user code that bypassed the loop, the exception propagates
+    unchanged.
+    """
 
 
 class MCPConnectionError(AgentError):
-    """MCP subprocess death / EOF on stdin (M8 round-2 closure)."""
+    """Raised when an MCP subprocess dies or EOFs on stdin.
+
+    Wraps the underlying transport failure (process exit, broken pipe,
+    EOF on stdin) so the agent's loop can mark the server **broken** for
+    the remainder of the run, fire ``on_error``, and route the failure up
+    the stack. Subsequent tool calls into the same server return a
+    ``"server unavailable"`` string to the LLM instead of crashing the
+    loop.
+    """
 
 
 class MCPProtocolError(AgentError):
-    """MCP invalid UTF-8 / malformed JSON-RPC frame (M8 round-2 closure)."""
+    """Raised when the MCP server emits an invalid frame.
+
+    Wraps invalid UTF-8 on stdout, malformed JSON-RPC payloads, and other
+    protocol-layer violations. The agent's loop treats this the same as
+    ``MCPConnectionError`` — mark the server broken, fire ``on_error``,
+    and re-raise so the caller can decide how to recover.
+    """
 
 
 # =====================================================================
