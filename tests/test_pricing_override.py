@@ -279,11 +279,15 @@ async def test_call_model_passes_per_instance_pricing_to_span_gen() -> None:
                 messages=[{"role": "user", "content": "hi"}],
             )
             # _SpanGeneration was instantiated with the per-instance
-            # pricing override as the third kwarg.
+            # pricing override as the third kwarg. Post-PR-review
+            # added ``trace_collector=`` for the ``agent.trace``
+            # retrieval path — agent passes its current ``AgentTrace``
+            # so the span helper can mirror spans in-process.
             tinyagent._SpanGeneration.assert_called_once_with(
                 agent._tracer,
                 "openai:gpt-4o",
                 pricing={"openai:gpt-4o": (1.0, 2.0)},
+                trace_collector=agent._trace,
             )
 
 
@@ -313,6 +317,7 @@ async def test_call_model_passes_none_pricing_when_no_override() -> None:
                 agent._tracer,
                 "openai:gpt-4o",
                 pricing=None,
+                trace_collector=agent._trace,
             )
 
 

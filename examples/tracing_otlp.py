@@ -113,7 +113,12 @@ def _build_callbacks() -> CallbackRegistry:
 
 
 async def amain() -> str:
-    """Run a single-turn task so at least one span ships to the exporter."""
+    """Run a single-turn task so at least one span ships to the exporter.
+
+    After the run completes, prints the in-memory ``agent.trace`` roll-up
+    (token counts and USD cost across the ``call_llm`` spans) so users
+    who don't have an OTLP collector can still see what happened.
+    """
     config = AgentConfig(
         instructions=(
             "Fetch the page at the URL the user gives you via `http_get` "
@@ -127,7 +132,31 @@ async def amain() -> str:
     )
     agent = TinyAgent(config)
     prompt = "Fetch http://example.com and summarise what the page says."
-    return await agent.run_async(prompt)
+    answer = await agent.run_async(prompt)
+
+    # Demonstrate the ``agent.trace`` retrieval path (plan §6 +
+    # post-PR-review BLOCKER fix). The trace is the in-memory mirror of
+    # the OTel hierarchy — one ``AgentSpan`` per ``invoke_agent`` /
+    # ``call_llm`` / ``execute_tool`` span.
+    trace = agent.trace
+    print(  # noqa: T201
+        f"[trace] {len(trace.spans)} spans captured in agent.trace "
+        f"(invoke_agent={sum(1 for s in trace.spans if s.name == 'invoke_agent')}, "
+        f"call_llm={sum(1 for s in trace.spans if s.name == 'call_llm')}, "
+        f"execute_tool={sum(1 for s in trace.spans if s.name == 'execute_tool')})",
+        file=sys.stderr,
+    )
+    tokens = trace.tokens
+    print(  # noqa: T201
+        f"[trace] tokens: input={tokens.input_tokens} output={tokens.output_tokens}",
+        file=sys.stderr,
+    )
+    cost = trace.cost
+    print(  # noqa: T201
+        f"[trace] cost: total_usd={cost.total_cost_usd:.6f}",
+        file=sys.stderr,
+    )
+    return answer
 
 
 if __name__ == "__main__":

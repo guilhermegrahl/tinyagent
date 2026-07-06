@@ -42,6 +42,7 @@ import json  # noqa: F401
 import logging
 import os  # noqa: F401
 import re  # noqa: F401
+import time  # T8+: span start/end timestamps on AgentSpan records
 import types as _types  # T10: TracebackType for __aexit__ signature
 from types import SimpleNamespace  # T12a: Context is a SimpleNamespace — see §2 section 8
 import uuid  # noqa: F401
@@ -1674,6 +1675,15 @@ class _SpanGeneration:
     price is unknown (plan §0 C2 + cross-cutting risk #8); the writer
     never emits a ``0.0`` placeholder, because that would make "unknown"
     indistinguishable from "actually free" in observability tooling.
+
+    When ``trace_collector`` is supplied, every opened span ALSO appends
+    an ``AgentSpan`` record to ``trace_collector.spans`` on exit. The
+    record captures the span name, attributes, parent linkage (via OTel
+    context), and start/end timestamps so callers can read the trace
+    back via the in-memory ``agent.trace`` API. This dual-emission is
+    what wires up the post-PR-review ``agent.trace`` retrieval path:
+    OTel spans ship out via the user's exporter AND a parallel
+    ``AgentTrace`` is populated for in-process inspection.
     """
 
     def __init__(
@@ -1681,6 +1691,7 @@ class _SpanGeneration:
         tracer: Any,
         model_id: str,
         pricing: dict[str, tuple[float, float]] | None = None,
+        trace_collector: AgentTrace | None = None,
     ) -> None:
         """Store the tracer and the model id used in ``gen_ai.request.model``.
 
@@ -1700,10 +1711,90 @@ class _SpanGeneration:
             back to the module-level ``PRICING_OVERRIDE`` then
             ``DEFAULT_PRICING`` lookup chain. The override is held on the
             instance only — it is NOT copied into module-level state.
+        trace_collector:
+            Optional ``AgentTrace`` whose ``spans`` list receives an
+            ``AgentSpan`` record per opened OTel span. When ``None``
+            (the default), spans are emitted to OTel only — no
+            in-memory mirror is built. Used by the agent loop to
+            populate ``self._trace`` so callers can read it back via
+            ``agent.trace``.
         """
         self._tracer = tracer
         self._model_id = model_id
         self._pricing_override = pricing
+        self._trace_collector = trace_collector
+
+    def _build_attrs_for_call_llm(self, response: Any) -> dict[str, Any]:
+        """Build the attribute dict for a ``call_llm`` span.
+
+        Extracted from ``call_llm`` so the recording wrapper below can
+        reuse it for both OTel emission and ``AgentSpan`` recording
+        (the in-memory trace mirrors the OTel attributes verbatim).
+        """
+        attrs: dict[str, Any] = {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.request.model": self._model_id,
+        }
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
+            out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
+            attrs["gen_ai.usage.input_tokens"] = in_tok
+            attrs["gen_ai.usage.output_tokens"] = out_tok
+            cost = _compute_cost_attribute(
+                self._model_id, in_tok, out_tok,
+                pricing=self._pricing_override,
+            )
+            if cost is not None:
+                attrs["gen_ai.usage.cost"] = cost
+        return attrs
+
+    @staticmethod
+    def _record_span(
+        trace_collector: AgentTrace | None,
+        name: str,
+        attrs: dict[str, Any],
+        span: Any,
+        start_time: float,
+    ) -> None:
+        """Append an ``AgentSpan`` record to ``trace_collector`` if one was provided.
+
+        Captures the span name, attributes, parent linkage (via the OTel
+        context — the current span BEFORE the new one was opened), and
+        end timestamp. No-op when ``trace_collector`` is ``None``.
+        """
+        if trace_collector is None:
+            return
+        # Capture parent linkage: the OTel context that was current
+        # BEFORE the new span opened. ``trace.get_current_span()``
+        # called inside the with-block returns the newly-opened span,
+        # so we use the parent that was stashed on entry (see the
+        # wrapper helpers below).
+        parent_span = _otel_trace.get_current_span()
+        parent_id: str | None = None
+        # The active span inside the with-block IS our new span; its
+        # ``parent`` attribute holds the prior context. Use that to
+        # derive the parent span_id. ``parent_span`` was captured for
+        # documentation; we read parent linkage from the new span's
+        # ``parent`` attribute (which is set by OTel on span start).
+        del parent_span
+        new_span_parent = getattr(span, "parent", None)
+        if new_span_parent is not None:
+            parent_ctx = getattr(new_span_parent, "context", None)
+            span_id = getattr(parent_ctx, "span_id", 0)
+            if parent_ctx is not None and span_id:
+                parent_id = str(span_id)
+
+        trace_collector.spans.append(
+            AgentSpan(
+                name=name,
+                attributes=dict(attrs),
+                kind="internal",
+                parent_id=parent_id,
+                start_time=start_time,
+                end_time=time.time(),
+            )
+        )
 
     def call_llm(self, response: Any) -> Any:
         """Open a ``call_llm`` span with token + cost attrs from ``response``.
@@ -1726,27 +1817,25 @@ class _SpanGeneration:
         unknown for this model, the cost attribute is omitted entirely
         (NEVER written as ``0.0``).
 
-        Returns the OTel context-manager produced by
-        ``tracer.start_as_current_span("call_llm", attributes=...)``.
-        Use as ``with span_gen.call_llm(response): ...``.
+        Returns a context manager that opens the OTel ``call_llm`` span
+        AND records an ``AgentSpan`` to the configured trace collector
+        (if any) on exit. Use as ``with span_gen.call_llm(response): ...``.
         """
-        attrs: dict[str, Any] = {
-            "gen_ai.operation.name": "chat",
-            "gen_ai.request.model": self._model_id,
-        }
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            in_tok = int(getattr(usage, "prompt_tokens", 0) or 0)
-            out_tok = int(getattr(usage, "completion_tokens", 0) or 0)
-            attrs["gen_ai.usage.input_tokens"] = in_tok
-            attrs["gen_ai.usage.output_tokens"] = out_tok
-            cost = _compute_cost_attribute(
-                self._model_id, in_tok, out_tok,
-                pricing=self._pricing_override,
+        attrs = self._build_attrs_for_call_llm(response)
+        trace_collector = self._trace_collector
+        tracer = self._tracer
+        span_name = "call_llm"
+
+        @contextlib.contextmanager
+        def _cm() -> Any:
+            start = time.time()
+            with tracer.start_as_current_span(span_name, attributes=attrs) as span:
+                yield span
+            _SpanGeneration._record_span(
+                trace_collector, span_name, attrs, span, start
             )
-            if cost is not None:
-                attrs["gen_ai.usage.cost"] = cost
-        return self._tracer.start_as_current_span("call_llm", attributes=attrs)
+
+        return _cm()
 
     def execute_tool(
         self,
@@ -1762,8 +1851,10 @@ class _SpanGeneration:
         ``SPAN_LIMITS["tool_result"]`` so that a model returning a 1 MB
         tool payload cannot blow up the span budget.
 
-        Returns the OTel context-manager produced by
-        ``tracer.start_as_current_span("execute_tool", attributes=...)``.
+        Returns a context manager that opens the OTel ``execute_tool``
+        span AND records an ``AgentSpan`` to the configured trace
+        collector (if any) on exit. Use as
+        ``with span_gen.execute_tool(...): ...``.
         """
         args_limit = SPAN_LIMITS.get("tool_args", 4096)
         result_limit = SPAN_LIMITS.get("tool_result", 4096)
@@ -1777,9 +1868,20 @@ class _SpanGeneration:
                 _stringify_for_span(result), result_limit
             ),
         }
-        return self._tracer.start_as_current_span(
-            "execute_tool", attributes=attrs
-        )
+        trace_collector = self._trace_collector
+        tracer = self._tracer
+        span_name = "execute_tool"
+
+        @contextlib.contextmanager
+        def _cm() -> Any:
+            start = time.time()
+            with tracer.start_as_current_span(span_name, attributes=attrs) as span:
+                yield span
+            _SpanGeneration._record_span(
+                trace_collector, span_name, attrs, span, start
+            )
+
+        return _cm()
 
 
 # ---------------------------------------------------------------------
@@ -2089,6 +2191,36 @@ class TinyAgent:
             dict(pricing_source) if pricing_source is not None else None
         )
 
+        # In-memory ``AgentTrace`` for the most recent run. The loop
+        # resets this to a fresh ``AgentTrace(spans=[])`` at the start
+        # of every ``run_async`` and populates ``spans`` via the span
+        # helpers (``_SpanGeneration`` records into it). Callers read
+        # it back via the ``trace`` property. Exposed alongside the
+        # OTel exporter so users can introspect the trace without
+        # needing OTLP — see the post-PR-review agent.trace blocker.
+        self._trace: AgentTrace = AgentTrace(spans=[])
+
+    @property
+    def trace(self) -> AgentTrace:
+        """Return the ``AgentTrace`` for the most recent ``run_async`` call.
+
+        The trace is an in-process mirror of the OTel hierarchy emitted
+        during the run: one ``AgentSpan`` per ``invoke_agent`` /
+        ``call_llm`` / ``execute_tool`` span. Spans carry their name,
+        attributes, parent linkage, and start/end timestamps.
+
+        The trace is reset at the start of every ``run_async`` call, so
+        ``agent.trace`` always reflects the **most recent** run. Reading
+        ``agent.trace`` before any ``run_async`` returns an empty
+        ``AgentTrace(spans=[])``.
+
+        Per plan §6 + post-PR-review BLOCKER: this is the in-process
+        sibling of the OTLP exporter — users wiring OTLP get spans
+        shipped to their collector; users who just want to inspect the
+        last run programmatically read ``agent.trace``.
+        """
+        return self._trace
+
     async def setup(self) -> None:
         """Open MCP server connections and merge their tools into ``_clients``.
 
@@ -2138,7 +2270,10 @@ class TinyAgent:
             timeout=self.config.request_timeout_s,
         )
         span_gen = _SpanGeneration(
-            self._tracer, self.config.model, pricing=self._pricing_override
+            self._tracer,
+            self.config.model,
+            pricing=self._pricing_override,
+            trace_collector=self._trace,
         )
         with span_gen.call_llm(response):
             pass
@@ -2276,11 +2411,34 @@ class TinyAgent:
         ``ToolNotFoundError`` is caught and translated to a descriptive
         error string so the LLM can self-correct; ``on_error`` does NOT
         fire — the rule (d) contract from plan §8.
+
+        Emits an OTel ``execute_tool`` span (via
+        ``_SpanGeneration.execute_tool``) so the OTel hierarchy shows
+        tool calls as children of ``invoke_agent`` (plan §6). The span
+        attributes carry the tool name, args, and the actual dispatch
+        result.
         """
         await self._callbacks.dispatch_async(
             "before_tool_execution",
             Context(agent=self, tool_call=tool_call, turn=turn),
         )
+        # Parse args once for the span attribute — the raw string from
+        # the LLM response is JSON-encoded; fall back to the raw string
+        # when JSON parsing fails so the attribute mirrors what the LLM
+        # actually sent.
+        raw_args = tool_call.function.arguments
+        try:
+            parsed_args: Any = json.loads(raw_args) if raw_args else {}
+        except (TypeError, ValueError):
+            parsed_args = raw_args
+
+        # Dispatch the tool first so the span attributes carry the
+        # actual result. We then emit the ``execute_tool`` span with
+        # the final attrs (plan §6 hierarchy requirement). The span
+        # duration is short (just the context-manager enter/exit) —
+        # we trade precise timing for correctness of the attrs,
+        # since ``_SpanGeneration.execute_tool`` builds attrs at
+        # start-time.
         try:
             result: Any = await self._dispatch_tool(tool_call)
         except ToolNotFoundError as exc:
@@ -2289,6 +2447,20 @@ class TinyAgent:
                 f"{sorted(self._clients)}"
             )
         result_str = str(result)
+
+        span_gen = _SpanGeneration(
+            self._tracer,
+            self.config.model,
+            pricing=self._pricing_override,
+            trace_collector=self._trace,
+        )
+        with span_gen.execute_tool(
+            tool_name=tool_call.function.name,
+            args=parsed_args,
+            result=result_str,
+        ):
+            pass
+
         await self._callbacks.dispatch_async(
             "after_tool_execution",
             Context(
@@ -2357,64 +2529,35 @@ class TinyAgent:
         # increment). The body assigns 0 here, then increments inside
         # the loop.
         turn: int = 0
+
+        # Reset the in-memory trace so this run's spans don't leak into
+        # a prior run's ``agent.trace``. The OTel exporter itself keeps
+        # a process-wide history of all spans (it does NOT get reset).
+        self._trace = AgentTrace(spans=[])
+
+        # Open the parent ``invoke_agent`` span. Every ``call_llm`` and
+        # ``execute_tool`` span emitted during the run will be its OTel
+        # child (the OTel context propagates automatically through the
+        # ``with`` block). We also record an ``AgentSpan`` for it in
+        # the in-memory trace so the hierarchy is mirrored end-to-end.
+        invoke_agent_attrs: dict[str, Any] = {
+            "gen_ai.agent.name": self.config.name,
+            "gen_ai.operation.name": "invoke_agent",
+        }
+        invoke_agent_start = time.time()
+
         try:
-            messages = self._initial_messages(prompt)
-
-            # --- Per-turn tool_choice retry state (round-3 M4) ---
-            tool_choice_for_next: str = "required"
-            retried_with_auto: bool = False
-
-            while turn < self.config.max_turns:
-                message = await self._llm_step(
-                    messages, tool_choice_for_next, turn, kwargs
-                )
-                empty_response = self._is_empty_response(message)
-
-                # d. Round-3 M4: retry once under "auto".
-                if (
-                    empty_response
-                    and tool_choice_for_next == "required"
-                    and not retried_with_auto
-                ):
-                    retried_with_auto = True
-                    tool_choice_for_next = "auto"
-                    # The empty message is NOT appended; the retry result
-                    # is the one we keep (or the error we raise).
-                    continue
-
-                # e. Empty after retry (or directly empty under auto): bail.
-                if empty_response:
-                    _empty_msg = (
-                        "model returned no tool calls and no assistant text under "
-                        "tool_choice=required (retried once with tool_choice=auto)"
+            with self._tracer.start_as_current_span(
+                "invoke_agent", attributes=invoke_agent_attrs
+            ) as invoke_agent_span:
+                try:
+                    return await self._run_async_loop(prompt, kwargs, turn)
+                finally:
+                    self._record_invoke_agent_span(
+                        invoke_agent_span,
+                        invoke_agent_attrs,
+                        invoke_agent_start,
                     )
-                    raise AgentError(_empty_msg)  # noqa: TRY301 — intentional; on_error fires
-
-                # f. Successful response — reset retry state for the next turn.
-                tool_choice_for_next = "required"
-                retried_with_auto = False
-                messages.append(message.model_dump())
-
-                # g. Trailing-text fallback (no tool_calls).
-                if not message.tool_calls:
-                    return str(message.content or "")
-
-                # h+i. Iterate tool_calls. The first ``final_answer`` short-circuits.
-                final_value = await self._run_tool_calls(message, messages, turn)
-                if final_value is not None:
-                    return final_value
-
-                # Pruning is owned by T12b (pair-preserving). T12a leaves the
-                # messages list intact end-of-turn so tests can assert on the
-                # exact construction without surprise mutation.
-
-                turn += 1
-
-            # Out of turns.
-            _max_turns_msg = (
-                f"max_turns={self.config.max_turns} exceeded without a final_answer"
-            )
-            raise AgentError(_max_turns_msg)  # noqa: TRY301 — intentional; on_error fires
         except AgentCancel:
             # User-initiated abort (raised from any hook). The user
             # explicitly invoked the abort path, so ``on_error`` does
@@ -2439,6 +2582,107 @@ class TinyAgent:
                 Context(agent=self, error=exc, turn=turn),
             )
             raise
+
+    async def _run_async_loop(
+        self,
+        prompt: str,
+        completion_kwargs: dict[str, Any],
+        start_turn: int,
+    ) -> str:
+        """Inner ReAct loop body — assumes the ``invoke_agent`` span is already open.
+
+        Factored out from ``run_async`` so the parent span wrapping and
+        the loop body can be controlled separately. The plan §8
+        pseudocode and round-3 M1/M4 closures live here.
+
+        ``invoke_agent`` is opened by the caller; this method only
+        drives the LLM/tool iteration and returns the final answer.
+        Any ``AgentError`` raised here propagates to ``run_async``'s
+        ``except`` arm and fires ``on_error``.
+        """
+        turn: int = start_turn
+        messages = self._initial_messages(prompt)
+
+        # --- Per-turn tool_choice retry state (round-3 M4) ---
+        tool_choice_for_next: str = "required"
+        retried_with_auto: bool = False
+
+        while turn < self.config.max_turns:
+            message = await self._llm_step(
+                messages, tool_choice_for_next, turn, completion_kwargs
+            )
+            empty_response = self._is_empty_response(message)
+
+            # d. Round-3 M4: retry once under "auto".
+            if (
+                empty_response
+                and tool_choice_for_next == "required"
+                and not retried_with_auto
+            ):
+                retried_with_auto = True
+                tool_choice_for_next = "auto"
+                # The empty message is NOT appended; the retry result
+                # is the one we keep (or the error we raise).
+                continue
+
+            # e. Empty after retry (or directly empty under auto): bail.
+            if empty_response:
+                _empty_msg = (
+                    "model returned no tool calls and no assistant text under "
+                    "tool_choice=required (retried once with tool_choice=auto)"
+                )
+                raise AgentError(_empty_msg)  # noqa: TRY301 — intentional; on_error fires
+
+            # f. Successful response — reset retry state for the next turn.
+            tool_choice_for_next = "required"
+            retried_with_auto = False
+            messages.append(message.model_dump())
+
+            # g. Trailing-text fallback (no tool_calls).
+            if not message.tool_calls:
+                return str(message.content or "")
+
+            # h+i. Iterate tool_calls. The first ``final_answer`` short-circuits.
+            final_value = await self._run_tool_calls(message, messages, turn)
+            if final_value is not None:
+                return final_value
+
+            # Pruning is owned by T12b (pair-preserving). T12a leaves the
+            # messages list intact end-of-turn so tests can assert on the
+            # exact construction without surprise mutation.
+
+            turn += 1
+
+        # Out of turns.
+        _max_turns_msg = (
+            f"max_turns={self.config.max_turns} exceeded without a final_answer"
+        )
+        raise AgentError(_max_turns_msg)  # noqa: TRY301 — intentional; on_error fires
+
+    def _record_invoke_agent_span(
+        self,
+        span: Any,
+        attrs: dict[str, Any],
+        start_time: float,
+    ) -> None:
+        """Append an ``AgentSpan`` for the ``invoke_agent`` parent to ``self._trace``.
+
+        The OTel span closes automatically on context exit; this helper
+        only mirrors it into the in-memory ``AgentTrace`` so
+        ``agent.trace`` shows the same hierarchy the OTel exporter
+        sees. ``invoke_agent`` is the root of the hierarchy, so its
+        ``parent_id`` is ``None``.
+        """
+        self._trace.spans.append(
+            AgentSpan(
+                name="invoke_agent",
+                attributes=dict(attrs),
+                kind="internal",
+                parent_id=None,
+                start_time=start_time,
+                end_time=time.time(),
+            )
+        )
 
     async def _llm_step(
         self,
